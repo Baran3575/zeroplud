@@ -297,6 +297,7 @@ type providerWizardState struct {
 	selectedProvider int
 	models           []providerWizardModel
 	selectedModel    int
+	providerSearch   string
 	modelSearch      string
 	baseURL          string
 	profileName      string
@@ -343,7 +344,18 @@ func providerWizardProviders() []providercatalog.Descriptor {
 }
 
 func (wizard *providerWizardState) currentProvider() providercatalog.Descriptor {
-	if wizard == nil || len(wizard.providers) == 0 {
+	if wizard == nil {
+		return providercatalog.Descriptor{}
+	}
+	if wizard.step == providerWizardStepProvider {
+		providers := wizard.filteredProviders()
+		if len(providers) == 0 {
+			return providercatalog.Descriptor{}
+		}
+		wizard.selectedProvider = clampInt(wizard.selectedProvider, 0, len(providers)-1)
+		return providers[wizard.selectedProvider]
+	}
+	if len(wizard.providers) == 0 {
 		return providercatalog.Descriptor{}
 	}
 	wizard.selectedProvider = clampInt(wizard.selectedProvider, 0, len(wizard.providers)-1)
@@ -399,10 +411,11 @@ func (wizard *providerWizardState) move(delta int) {
 		}
 		wizard.selectedMethod = ((wizard.selectedMethod+delta)%len(options) + len(options)) % len(options)
 	case providerWizardStepProvider:
-		if len(wizard.providers) == 0 {
+		providers := wizard.filteredProviders()
+		if len(providers) == 0 {
 			return
 		}
-		wizard.selectedProvider = ((wizard.selectedProvider+delta)%len(wizard.providers) + len(wizard.providers)) % len(wizard.providers)
+		wizard.selectedProvider = ((wizard.selectedProvider+delta)%len(providers) + len(providers)) % len(providers)
 		wizard.selectedModel = 0
 		wizard.modelSearch = ""
 		wizard.baseURL = ""
@@ -450,6 +463,18 @@ func (wizard *providerWizardState) advance() {
 		if wizard.oauthMode {
 			return
 		}
+		// Resolve the selected provider's index in the full list before clearing
+		// the search — selectedProvider is an index into the filtered slice, and
+		// clearing the search swaps to the full list.
+		if selected := wizard.currentProvider(); selected.ID != "" {
+			for i, p := range wizard.providers {
+				if p.ID == selected.ID {
+					wizard.selectedProvider = i
+					break
+				}
+			}
+		}
+		wizard.providerSearch = ""
 		wizard.refreshModels()
 		wizard.err = ""
 		if providerWizardNeedsEndpoint(wizard.currentProvider()) {
@@ -513,6 +538,7 @@ func (wizard *providerWizardState) retreat() {
 		wizard.step = providerWizardStepMethod
 	case providerWizardStepEndpoint:
 		wizard.step = providerWizardStepProvider
+		wizard.providerSearch = ""
 	case providerWizardStepName:
 		wizard.step = providerWizardStepEndpoint
 	case providerWizardStepCredential:
@@ -627,6 +653,20 @@ func (m model) handleProviderWizardKey(msg tea.KeyMsg) (model, tea.Cmd) {
 		(keyText(msg) == "d" || keyText(msg) == "D") &&
 		m.providerWizard.currentProvider().OAuthDeviceFlow {
 		return m.startProviderDeviceLogin()
+	}
+	if m.providerWizard.step == providerWizardStepProvider {
+		switch {
+		case keyText(msg) != "":
+			m.providerWizard.appendProviderSearch(keyRunes(msg))
+			return m, nil
+		case keyBackspace(msg):
+			m.providerWizard.deleteProviderSearchRune()
+			return m, nil
+		case keyCtrl(msg, 'u'):
+			m.providerWizard.providerSearch = ""
+			m.providerWizard.selectedProvider = 0
+			return m, nil
+		}
 	}
 	if m.providerWizard.step == providerWizardStepEndpoint {
 		switch {
@@ -746,6 +786,8 @@ func (m model) handleProviderWizardPaste(content string) (model, tea.Cmd) {
 		return m, nil
 	}
 	switch m.providerWizard.step {
+	case providerWizardStepProvider:
+		m.providerWizard.appendProviderSearch([]rune(content))
 	case providerWizardStepEndpoint:
 		m.providerWizard.appendBaseURL([]rune(content))
 	case providerWizardStepName:
@@ -879,6 +921,50 @@ func (wizard *providerWizardState) deleteModelSearchRune() {
 	wizard.selectedModel = 0
 }
 
+func (wizard *providerWizardState) appendProviderSearch(runes []rune) {
+	for _, r := range runes {
+		if unicode.IsControl(r) {
+			continue
+		}
+		wizard.providerSearch += string(r)
+	}
+	wizard.selectedProvider = 0
+}
+
+func (wizard *providerWizardState) deleteProviderSearchRune() {
+	if wizard.providerSearch == "" {
+		return
+	}
+	runes := []rune(wizard.providerSearch)
+	wizard.providerSearch = string(runes[:len(runes)-1])
+	wizard.selectedProvider = 0
+}
+
+func (wizard *providerWizardState) filteredProviders() []providercatalog.Descriptor {
+	if wizard == nil {
+		return nil
+	}
+	query := strings.ToLower(strings.TrimSpace(wizard.providerSearch))
+	if query == "" {
+		return append([]providercatalog.Descriptor{}, wizard.providers...)
+	}
+	providers := make([]providercatalog.Descriptor, 0, len(wizard.providers))
+	for _, provider := range wizard.providers {
+		if providerMatchesQuery(provider, query) {
+			providers = append(providers, provider)
+		}
+	}
+	return providers
+}
+
+func providerMatchesQuery(provider providercatalog.Descriptor, query string) bool {
+	if query == "" {
+		return true
+	}
+	haystack := strings.ToLower(strings.Join([]string{provider.ID, provider.Name, strings.Join(provider.Aliases, " ")}, " "))
+	return strings.Contains(haystack, query)
+}
+
 func (m model) applyProviderWizard() (model, tea.Cmd) {
 	wizard := m.providerWizard
 	if wizard == nil {
@@ -942,7 +1028,8 @@ func (m model) wizardProviderStoredKey(provider providercatalog.Descriptor) (str
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(profile.Name), strings.TrimSpace(provider.Name)) ||
-			strings.EqualFold(strings.TrimSpace(profile.CatalogID), strings.TrimSpace(provider.ID)) ||
+			(!genericProviderCatalogID(provider.ID) &&
+				strings.EqualFold(strings.TrimSpace(profile.CatalogID), strings.TrimSpace(provider.ID))) ||
 			strings.EqualFold(strings.TrimSpace(profile.Name), strings.TrimSpace(provider.ID)) {
 			return profile.Name, true
 		}
@@ -963,7 +1050,13 @@ func (m model) applyManageKeyChoice() (model, tea.Cmd) {
 	case 1: // Replace
 		wizard.apiKey = ""
 		wizard.err = ""
-		wizard.step = providerWizardStepCredential
+		wizard.baseURL = ""
+		wizard.profileName = ""
+		if providerWizardNeedsEndpoint(wizard.currentProvider()) {
+			wizard.step = providerWizardStepEndpoint
+		} else {
+			wizard.step = providerWizardStepCredential
+		}
 		return m, nil
 	case 2: // Remove
 		if strings.TrimSpace(m.userConfigPath) != "" {
@@ -1248,9 +1341,15 @@ func (wizard *providerWizardState) renderProviderStep(width int) []string {
 		header = "Choose an OAuth provider"
 	}
 	lines := []string{zeroTheme.accent.Render(header)}
-	maxVisible := minInt(maxProviderWizardProvidersVisible, len(wizard.providers))
-	start := selectableListStart(len(wizard.providers), maxVisible, wizard.selectedProvider)
-	for offset, provider := range wizard.providers[start : start+maxVisible] {
+	lines = append(lines, wizard.renderProviderSearch(width))
+	providers := wizard.filteredProviders()
+	if len(providers) == 0 {
+		lines = append(lines, zeroTheme.faint.Render("  no matching providers"))
+		return lines
+	}
+	maxVisible := minInt(maxProviderWizardProvidersVisible, len(providers))
+	start := selectableListStart(len(providers), maxVisible, wizard.selectedProvider)
+	for offset, provider := range providers[start : start+maxVisible] {
 		lines = append(lines, wizard.renderSelectableProvider(width, start+offset, provider))
 	}
 	// A failed OAuth attempt leaves the wizard on this list (it does not advance),
@@ -1263,6 +1362,11 @@ func (wizard *providerWizardState) renderProviderStep(width int) []string {
 		}
 	}
 	return lines
+}
+
+func (wizard *providerWizardState) renderProviderSearch(width int) string {
+	query := strings.TrimSpace(wizard.providerSearch)
+	return providerWizardInputLine("search > ", query, "provider name, id, or alias...", width)
 }
 
 // providerWizardOAuthErrHint returns a provider-specific next step for a failed

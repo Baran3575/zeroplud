@@ -187,6 +187,59 @@ func TestDetectShellCommandIssueAllowsUnrelatedCommands(t *testing.T) {
 	}
 }
 
+func TestDetectShellCommandIssueFlagsWindowsInlineCodeQuoting(t *testing.T) {
+	for _, command := range []string{
+		`py -c "import py_compile; py_compile.compile('file.py', doraise=True)"`,
+		`python3 -c "print('hello world')"`,
+		`python -c 'import os; os.system("echo test")'`,
+		`node -e "console.log('test')"`,
+		`python -c "import sys; sys.path.insert(0, '/path/to/dir')"`,
+	} {
+		issue := detectShellCommandIssue(command, "windows")
+		if issue == nil {
+			t.Fatalf("expected inline code quoting to be flagged for %q", command)
+		}
+		if issue.Kind != "windows_shell_quoting" {
+			t.Fatalf("expected kind windows_shell_quoting, got %s", issue.Kind)
+		}
+		if !strings.Contains(issue.Suggestion, "write_file") {
+			t.Fatalf("expected suggestion to mention write_file, got %q", issue.Suggestion)
+		}
+	}
+}
+
+func TestDetectShellCommandIssueAllowsSafeWindowsCommands(t *testing.T) {
+	for _, command := range []string{
+		`python --version`,
+		`py -m pip install requests`,
+		`pip install flask`,
+	} {
+		issue := detectShellCommandIssue(command, "windows")
+		if issue != nil && issue.Kind == "windows_shell_quoting" {
+			t.Fatalf("expected safe command to pass, got %#v for %q", issue, command)
+		}
+	}
+}
+
+func TestDetectShellCommandIssueFlagsInlineCodeWithNestedQuote(t *testing.T) {
+	for _, command := range []string{
+		`py -c "print('hello')"`,
+		`node -e "console.log('ok')"`,
+	} {
+		issue := detectShellCommandIssue(command, "windows")
+		if issue == nil || issue.Kind != "windows_shell_quoting" {
+			t.Fatalf("expected inline code with nested quotes to be flagged for %q", command)
+		}
+	}
+}
+
+func TestDetectShellCommandIssueInlineCodePassesOnNonWindows(t *testing.T) {
+	issue := detectShellCommandIssue(`py -c "import py_compile; py_compile.compile('file.py', doraise=True)"`, "linux")
+	if issue != nil {
+		t.Fatalf("expected no issue on non-Windows, got %#v", issue)
+	}
+}
+
 func TestDetectShellOutputIssueAddsWindowsSyntaxHint(t *testing.T) {
 	issue := detectShellOutputIssue(`cd /d/tmp/zero-pr-158 && ls -la`, "The syntax of the command is incorrect.", "windows")
 	if issue == nil {

@@ -5,10 +5,13 @@ import (
 	"strings"
 )
 
-type shellRuntime struct {
-	GOOS       string
-	Executable string
-	Syntax     string
+type ShellRuntime interface {
+	GOOS() string
+	Executable() string
+	Syntax() string
+	PreFlightCheck(command string) *shellIssue
+	PostFlightCheck(command string, output string) *shellIssue
+	Guidance() string
 }
 
 type shellIssue struct {
@@ -20,40 +23,28 @@ type shellIssue struct {
 var (
 	windowsBashStyleCDPattern = regexp.MustCompile(`(?i)(^|[&|;]\s*)cd\s+/(?:[a-ce-z0-9_./~-]|d[a-z0-9_./~-])[a-z0-9_./~-]*`)
 	windowsLSCommandPattern   = regexp.MustCompile(`(?i)(^|[&|;]\s*)ls\b(?:\s+|$)`)
-	// windowsPosixUtilityPattern catches the other common POSIX coreutils/grep
-	// family commands cmd.exe has no equivalent for (unlike `dir`/`findstr`,
-	// which sound similar enough that a model might reach for the POSIX name
-	// instead) — most often seen piped in, e.g. `git log ... | head`.
 	windowsPosixUtilityPattern = regexp.MustCompile(`(?i)(^|[&|;]\s*)(head|tail|grep|wc|awk|sed|cut|xargs|tr)\b`)
+	windowsInlineCodeRe       = regexp.MustCompile(`(?i)(?:^|[|;&]\s*)(?:python|python3|py|node)\s+(?:-c|-e)\s+(["'])`)
 )
 
-func detectShellRuntime(goos string) shellRuntime {
-	if goos == "windows" {
-		return shellRuntime{GOOS: goos, Executable: "cmd.exe", Syntax: "Windows cmd.exe"}
-	}
-	return shellRuntime{GOOS: goos, Executable: "/bin/sh", Syntax: "/bin/sh"}
+type windowsCmdRuntime struct{}
+
+func (windowsCmdRuntime) GOOS() string       { return "windows" }
+func (windowsCmdRuntime) Executable() string { return "cmd.exe" }
+func (windowsCmdRuntime) Syntax() string     { return "Windows cmd.exe" }
+func (windowsCmdRuntime) Guidance() string {
+	return "Uses Windows cmd.exe syntax on Windows; prefer cwd over cd when changing directories."
 }
 
-func shellGuidanceForGOOS(goos string) string {
-	runtime := detectShellRuntime(goos)
-	if goos == "windows" {
-		return "Uses " + runtime.Syntax + " syntax on Windows; prefer cwd over cd when changing directories."
-	}
-	guidance := "Uses " + runtime.Syntax + " syntax."
-	if goos == "darwin" {
-		// `ps` is setuid root and cannot run under the macOS sandbox; `pgrep` needs a
-		// blocked system service. Point the model at the tools that DO work so it
-		// doesn't waste turns: lsof to find a process, kill to stop it.
-		guidance += " To find or stop a process, use `lsof -i :PORT` (or `lsof -nP -iTCP -sTCP:LISTEN`) for the PID then `kill <pid>`; `ps` and `pgrep` do not work under the sandbox."
-	}
-	return guidance
-}
-
-func detectShellCommandIssue(command string, goos string) *shellIssue {
-	if goos != "windows" {
-		return nil
-	}
+func (windowsCmdRuntime) PreFlightCheck(command string) *shellIssue {
 	trimmed := strings.TrimSpace(command)
+	if detectWindowsInlineCodeQuoting(trimmed) {
+		return &shellIssue{
+			Kind:       "windows_shell_quoting",
+			Message:    "Command uses -c/-e inline code with nested quotes that Windows cmd.exe will mangle.",
+			Suggestion: "Write the code to a temp .py/.js file with write_file, then run that file with the interpreter.",
+		}
+	}
 	if windowsBashStyleCDPattern.MatchString(trimmed) ||
 		windowsLSCommandPattern.MatchString(trimmed) {
 		return &shellIssue{
@@ -72,10 +63,7 @@ func detectShellCommandIssue(command string, goos string) *shellIssue {
 	return nil
 }
 
-func detectShellOutputIssue(command string, output string, goos string) *shellIssue {
-	if goos != "windows" {
-		return nil
-	}
+func (windowsCmdRuntime) PostFlightCheck(command string, output string) *shellIssue {
 	haystack := strings.ToLower(command + "\n" + output)
 	if strings.Contains(haystack, "the syntax of the command is incorrect") ||
 		strings.Contains(haystack, "is not recognized as an internal or external command") {
@@ -86,6 +74,70 @@ func detectShellOutputIssue(command string, output string, goos string) *shellIs
 		}
 	}
 	return nil
+}
+
+type posixShellRuntime struct {
+	goos string
+}
+
+func (r posixShellRuntime) GOOS() string       { return r.goos }
+func (r posixShellRuntime) Executable() string { return "/bin/sh" }
+func (r posixShellRuntime) Syntax() string     { return "/bin/sh" }
+
+func (posixShellRuntime) PreFlightCheck(string) *shellIssue               { return nil }
+func (posixShellRuntime) PostFlightCheck(string, string) *shellIssue      { return nil }
+
+func (r posixShellRuntime) Guidance() string {
+	guidance := "Uses " + r.Syntax() + " syntax."
+	if r.goos == "darwin" {
+		guidance += " To find or stop a process, use `lsof -i :PORT` (or `lsof -nP -iTCP -sTCP:LISTEN`) for the PID then `kill <pid>`; `ps` and `pgrep` do not work under the sandbox."
+	}
+	return guidance
+}
+
+func getShellRuntime(goos string) ShellRuntime {
+	if goos == "windows" {
+		return windowsCmdRuntime{}
+	}
+	return posixShellRuntime{goos: goos}
+}
+
+// detectWindowsInlineCodeQuoting checks whether command uses -c / -e with
+// inline code whose quoted payload contains additional quote characters that
+// cmd.exe will mangle.
+func detectWindowsInlineCodeQuoting(command string) bool {
+	matches := windowsInlineCodeRe.FindStringSubmatch(command)
+	if len(matches) < 2 {
+		return false
+	}
+	quote := matches[1]
+	idx := strings.Index(command, matches[0])
+	if idx < 0 {
+		return false
+	}
+	payload := command[idx+len(matches[0]):]
+	endQuote := strings.IndexByte(payload, quote[0])
+	if endQuote < 0 {
+		return false
+	}
+	inner := payload[:endQuote]
+	otherQuote := `'`
+	if quote == "'" {
+		otherQuote = `"`
+	}
+	return strings.Contains(inner, otherQuote)
+}
+
+func shellGuidanceForGOOS(goos string) string {
+	return getShellRuntime(goos).Guidance()
+}
+
+func detectShellCommandIssue(command string, goos string) *shellIssue {
+	return getShellRuntime(goos).PreFlightCheck(command)
+}
+
+func detectShellOutputIssue(command string, output string, goos string) *shellIssue {
+	return getShellRuntime(goos).PostFlightCheck(command, output)
 }
 
 func appendShellIssueHint(output string, issue shellIssue) string {

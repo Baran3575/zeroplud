@@ -1572,7 +1572,7 @@ func (wizard *providerWizardState) renderSelectableModel(width int, index int, m
 	}
 	left := marker + surface(zeroTheme.ink).Render(model.displayLabel())
 	if slug := strings.TrimSpace(model.ID); slug != "" && slug != model.displayLabel() {
-		left += surface(zeroTheme.faintest).Render(" " + slug)
+		left += surface(zeroTheme.faintest).Render(" (" + slug + ")")
 	}
 	return fitStyledLine(left, width)
 }

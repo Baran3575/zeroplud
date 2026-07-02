@@ -898,7 +898,7 @@ func renderModelPickerRow(width int, selected bool, item pickerItem) string {
 	// Append the model slug/id in faint text so users can tell models apart
 	// even when their display names are truncated or near-identical.
 	if slug := strings.TrimSpace(item.Value); slug != "" && slug != label {
-		left += surface(zeroTheme.faintest).Render(" " + slug)
+		left += surface(zeroTheme.faintest).Render(" (" + slug + ")")
 	}
 	// The provider is shown as a section header above each group, so rows no longer
 	// repeat it as a right-aligned tag (matches a grouped provider+model list).

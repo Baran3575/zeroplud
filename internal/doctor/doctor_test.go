@@ -411,6 +411,30 @@ func TestFormatDetailValueRendersMapForHumans(t *testing.T) {
 	}
 }
 
+func TestRuntimeCheckFailsWhenNativeBinaryMissingBehindCmdWrapper(t *testing.T) {
+	// Simulate running through a .cmd wrapper by stubbing os.Executable to return
+	// a .cmd path whose companion .exe does not exist. The check must fail.
+	origExecutable := osExecutable
+	defer func() { osExecutable = origExecutable }()
+	osExecutable = func() (string, error) {
+		return filepath.Join(t.TempDir(), "zero.cmd"), nil
+	}
+	check := runtimeCheck("go")
+	if check.Status != StatusFail {
+		t.Fatalf("expected runtime check to fail when .exe is missing behind .cmd, got %s", check.Status)
+	}
+	if !strings.Contains(check.Message, "native binary") {
+		t.Fatalf("expected message about native binary, got %q", check.Message)
+	}
+}
+
+func TestRuntimeCheckPassesWhenRunningDirectBinary(t *testing.T) {
+	check := runtimeCheck("go")
+	if check.Status != StatusPass {
+		t.Fatalf("expected runtime check to pass, got %s", check.Status)
+	}
+}
+
 func TestDoctorFailsRemoteProviderWithoutCredential(t *testing.T) {
 	// AUDIT-H9: a remote provider with no key must NOT yield "Overall: pass".
 	report := Run(Options{

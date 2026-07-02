@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -25,6 +26,9 @@ const (
 	StatusWarn Status = "warn"
 	StatusFail Status = "fail"
 )
+
+// osExecutable is a variable so tests can stub it.
+var osExecutable = os.Executable
 
 type Check struct {
 	ID      string         `json:"id"`
@@ -118,6 +122,18 @@ func runtimeCheck(runtime string) Check {
 	runtime = strings.TrimSpace(runtime)
 	if runtime == "" {
 		runtime = "go"
+	}
+	// Verify the native binary exists next to any wrapper script (npm .cmd/.bat).
+	if exePath, err := osExecutable(); err == nil {
+		ext := strings.ToLower(filepath.Ext(exePath))
+		if ext == ".cmd" || ext == ".bat" {
+			nativePath := exePath[:len(exePath)-len(ext)] + ".exe"
+			if _, err := os.Stat(nativePath); os.IsNotExist(err) {
+				return check("runtime.go", "Go runtime", StatusFail,
+					fmt.Sprintf("Zero Go runtime is not available: the native binary at %s was not found next to the cmd wrapper.", nativePath),
+					map[string]any{"runtime": runtime, "nativeBinary": nativePath})
+			}
+		}
 	}
 	return check("runtime.go", "Go runtime", StatusPass, fmt.Sprintf("Zero Go runtime is available (%s).", runtime), map[string]any{"runtime": runtime})
 }

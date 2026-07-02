@@ -16,7 +16,6 @@ import (
 	"github.com/Gitlawb/zero/internal/sandbox"
 	"github.com/Gitlawb/zero/internal/streamjson"
 	"github.com/Gitlawb/zero/internal/tools"
-	"github.com/Gitlawb/zero/internal/tui"
 	"github.com/Gitlawb/zero/internal/zeroruntime"
 )
 
@@ -35,6 +34,31 @@ const (
 )
 
 var errPermissionApprovalCanceled = errors.New("permission approval cancelled")
+
+// knownControlTokens lists tokens that models may leak into visible output.
+var knownControlTokens = []string{
+	"<|eom|>",
+	"<|im_end|>",
+	"<|endoftext|>",
+	"<|end|>",
+	"<|startoftext|>",
+	"<\\s>",
+	"<|tool_call|>",
+	"<|tool_result|>",
+	"</tool>",
+}
+
+// detectControlTokenLeakage scans text for leaked control tokens and returns
+// the first token found, or empty string if none.
+func detectControlTokenLeakage(text string) string {
+	lower := strings.ToLower(text)
+	for _, tok := range knownControlTokens {
+		if strings.Contains(lower, strings.ToLower(tok)) {
+			return tok
+		}
+	}
+	return ""
+}
 
 // isImageRejectionError reports whether err is a provider 400 that rejects
 // image/multimodal content. This is checked BEFORE the compaction-retry path

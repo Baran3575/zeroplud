@@ -6,21 +6,25 @@ import (
 )
 
 func TestDetectLeakedControlTokensDetectsControlToken(t *testing.T) {
-	warning := detectLeakedControlTokens("Hello <|im_start|> world")
+	warning := detectLeakedControlTokens("Hello <|im_end|> world")
 	if warning == "" {
 		t.Fatal("expected warning for leaked control token")
 	}
-	if !strings.Contains(warning, "control tokens") {
-		t.Fatalf("expected warning to mention control tokens, got %q", warning)
+	if !strings.Contains(warning, "<|im_end|>") {
+		t.Fatalf("expected warning to mention the leaked token, got %q", warning)
 	}
 }
 
-func TestDetectLeakedControlTokensDetectsAnyAngleBracketPattern(t *testing.T) {
+func TestDetectLeakedControlTokensDetectsKnownLeakedTokens(t *testing.T) {
 	cases := []string{
-		"<|im_start|>",
-		"<|endoftext|>",
-		"prefix <|something|> suffix",
+		"<|eom|>",
 		"<|im_end|>",
+		"<|endoftext|>",
+		"<|end|>",
+		"<|startoftext|>",
+		"<|tool_call|>",
+		"<|tool_result|>",
+		"</tool>",
 	}
 	for _, tc := range cases {
 		if warning := detectLeakedControlTokens(tc); warning == "" {
@@ -51,7 +55,7 @@ func TestReduceTranscriptAppendsControlTokenWarning(t *testing.T) {
 	})
 	found := false
 	for _, row := range rows {
-		if row.kind == rowSystem && strings.Contains(row.text, "control tokens") {
+		if row.kind == rowSystem && strings.Contains(row.text, "Control token leaked:") {
 			found = true
 			break
 		}
@@ -67,7 +71,7 @@ func TestReduceTranscriptSkipsWarningForCleanText(t *testing.T) {
 		text: "Clean text without control tokens",
 	})
 	for _, row := range rows {
-		if row.kind == rowSystem && strings.Contains(row.text, "control tokens") {
+		if row.kind == rowSystem && strings.Contains(row.text, "Control token leaked:") {
 			t.Fatalf("unexpected control token warning for clean text")
 		}
 	}

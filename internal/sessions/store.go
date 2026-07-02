@@ -1,15 +1,18 @@
 package sessions
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,8 +20,9 @@ import (
 )
 
 const (
-	MetadataFile = "metadata.json"
-	EventsFile   = "events.jsonl"
+	MetadataFile    = "metadata.json"
+	EventsFile      = "events.jsonl"
+	EventsIndexFile = "events.jsonl.idx"
 )
 
 type EventType string
@@ -195,6 +199,12 @@ type Store struct {
 	// is accepted deliberately rather than risk an unsafe eviction.
 	sessionLocks map[string]*sync.Mutex
 	idCounter    atomic.Uint64
+
+	writersMu    sync.Mutex
+	eventFiles   map[string]*os.File
+	eventWriters map[string]*bufio.Writer
+	indexFiles   map[string]*os.File
+	indexWriters map[string]*bufio.Writer
 }
 
 var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
@@ -208,7 +218,15 @@ func NewStore(options StoreOptions) *Store {
 	if now == nil {
 		now = time.Now
 	}
-	return &Store{RootDir: rootDir, now: now, sessionLocks: map[string]*sync.Mutex{}}
+	return &Store{
+		RootDir:      rootDir,
+		now:          now,
+		sessionLocks: map[string]*sync.Mutex{},
+		eventFiles:   map[string]*os.File{},
+		eventWriters: map[string]*bufio.Writer{},
+		indexFiles:   map[string]*os.File{},
+		indexWriters: map[string]*bufio.Writer{},
+	}
 }
 
 func DefaultRoot(env map[string]string) string {
@@ -603,25 +621,37 @@ func (store *Store) appendEventLocked(sessionID string, input AppendEventInput) 
 	if err != nil {
 		return Event{}, fmt.Errorf("encode zero session event: %w", err)
 	}
-	file, err := os.OpenFile(store.eventsPath(sessionID), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	eventBufW, indexBufW, err := store.getSessionWriters(sessionID)
 	if err != nil {
+		return Event{}, fmt.Errorf("get session writers: %w", err)
+	}
+	// Flush the event buffer so the file offset is up-to-date before seeking.
+	if err := eventBufW.Flush(); err != nil {
+		return Event{}, fmt.Errorf("flush event writer: %w", err)
+	}
+	offset, err := store.eventFiles[sessionID].Seek(0, io.SeekEnd)
+	if err != nil {
+		return Event{}, fmt.Errorf("seek event file: %w", err)
+	}
+	if _, err := eventBufW.Write(append(data, '\n')); err != nil {
 		return Event{}, fmt.Errorf("append zero session event: %w", err)
 	}
-	if _, err := file.Write(append(data, '\n')); err != nil {
-		_ = file.Close()
-		return Event{}, fmt.Errorf("append zero session event: %w", err)
+	if _, err := fmt.Fprintf(indexBufW, "%d %d\n", sequence, offset); err != nil {
+		return Event{}, fmt.Errorf("write event index: %w", err)
 	}
 	// fsync the event before reporting success: the derived metadata.json IS
 	// fsync'd (writeMetadata), so without this a crash after the metadata flush
 	// but before the events.jsonl page reaches disk leaves EventCount ahead of the
 	// durable log — silently losing the just-appended event (incl. the checkpoint
 	// that /rewind targets). Make the log at least as durable as its metadata. (AUDIT-M12)
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return Event{}, fmt.Errorf("sync zero session event: %w", err)
+	if err := eventBufW.Flush(); err != nil {
+		return Event{}, fmt.Errorf("flush event writer: %w", err)
 	}
-	if err := file.Close(); err != nil {
-		return Event{}, fmt.Errorf("close zero session event file: %w", err)
+	if err := indexBufW.Flush(); err != nil {
+		return Event{}, fmt.Errorf("flush index writer: %w", err)
+	}
+	if err := store.eventFiles[sessionID].Sync(); err != nil {
+		return Event{}, fmt.Errorf("sync zero session event: %w", err)
 	}
 	session.UpdatedAt = timestamp
 	session.EventCount = sequence
@@ -714,6 +744,196 @@ func (store *Store) ReadEvents(sessionID string) ([]Event, error) {
 	return events, nil
 }
 
+func (store *Store) getSessionWriters(sessionID string) (*bufio.Writer, *bufio.Writer, error) {
+	store.writersMu.Lock()
+	defer store.writersMu.Unlock()
+
+	if store.eventWriters[sessionID] != nil {
+		return store.eventWriters[sessionID], store.indexWriters[sessionID], nil
+	}
+
+	eventFile, err := os.OpenFile(store.eventsPath(sessionID), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open events file: %w", err)
+	}
+	store.eventFiles[sessionID] = eventFile
+	store.eventWriters[sessionID] = bufio.NewWriter(eventFile)
+
+	indexFile, err := os.OpenFile(store.eventsIndexPath(sessionID), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	if err != nil {
+		eventFile.Close()
+		delete(store.eventFiles, sessionID)
+		delete(store.eventWriters, sessionID)
+		return nil, nil, fmt.Errorf("open index file: %w", err)
+	}
+	store.indexFiles[sessionID] = indexFile
+	store.indexWriters[sessionID] = bufio.NewWriter(indexFile)
+
+	return store.eventWriters[sessionID], store.indexWriters[sessionID], nil
+}
+
+func (store *Store) closeSessionWriters(sessionID string) error {
+	store.writersMu.Lock()
+	defer store.writersMu.Unlock()
+
+	if ew := store.eventWriters[sessionID]; ew != nil {
+		if err := ew.Flush(); err != nil {
+			return err
+		}
+	}
+	if ef := store.eventFiles[sessionID]; ef != nil {
+		if err := ef.Close(); err != nil {
+			return err
+		}
+	}
+	if iw := store.indexWriters[sessionID]; iw != nil {
+		if err := iw.Flush(); err != nil {
+			return err
+		}
+	}
+	if inf := store.indexFiles[sessionID]; inf != nil {
+		if err := inf.Close(); err != nil {
+			return err
+		}
+	}
+	delete(store.eventWriters, sessionID)
+	delete(store.eventFiles, sessionID)
+	delete(store.indexWriters, sessionID)
+	delete(store.indexFiles, sessionID)
+	return nil
+}
+
+func (store *Store) ReadEvent(sessionID string, eventNum int) (Event, error) {
+	if !ValidSessionID(sessionID) {
+		return Event{}, fmt.Errorf("invalid zero session id %q", sessionID)
+	}
+	data, err := os.ReadFile(store.eventsIndexPath(sessionID))
+	if err != nil {
+		return Event{}, fmt.Errorf("read event index: %w", err)
+	}
+	var offset int64 = -1
+	lines := bytes.Split(data, []byte{'\n'})
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		parts := bytes.SplitN(line, []byte{' '}, 2)
+		if len(parts) != 2 {
+			continue
+		}
+		seq, err := strconv.Atoi(string(parts[0]))
+		if err != nil || seq != eventNum {
+			continue
+		}
+		offset, err = strconv.ParseInt(string(parts[1]), 10, 64)
+		if err != nil {
+			continue
+		}
+		break
+	}
+	if offset < 0 {
+		return Event{}, fmt.Errorf("event %d not found in session %s", eventNum, sessionID)
+	}
+	file, err := os.Open(store.eventsPath(sessionID))
+	if err != nil {
+		return Event{}, fmt.Errorf("open events file: %w", err)
+	}
+	defer file.Close()
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return Event{}, fmt.Errorf("seek to event offset: %w", err)
+	}
+	reader := bufio.NewReader(file)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return Event{}, fmt.Errorf("read event line: %w", err)
+	}
+	var event Event
+	if err := json.Unmarshal(bytes.TrimSpace(line), &event); err != nil {
+		return Event{}, fmt.Errorf("decode event: %w", err)
+	}
+	return event, nil
+}
+
+func (store *Store) Compact(sessionID string) error {
+	if !ValidSessionID(sessionID) {
+		return fmt.Errorf("invalid zero session id %q", sessionID)
+	}
+	if err := store.closeSessionWriters(sessionID); err != nil {
+		return fmt.Errorf("close writers: %w", err)
+	}
+	events, err := store.ReadEvents(sessionID)
+	if err != nil {
+		return err
+	}
+	var checkpoints, nonCheckpoints []Event
+	for _, ev := range events {
+		if ev.Type == EventSessionCheckpoint {
+			checkpoints = append(checkpoints, ev)
+		} else {
+			nonCheckpoints = append(nonCheckpoints, ev)
+		}
+	}
+	const maxKeep = 50
+	if len(nonCheckpoints) <= maxKeep {
+		return nil
+	}
+	kept := checkpoints
+	kept = append(kept, nonCheckpoints[len(nonCheckpoints)-maxKeep:]...)
+	sort.Slice(kept, func(i, j int) bool {
+		return kept[i].Sequence < kept[j].Sequence
+	})
+	path := store.eventsPath(sessionID)
+	tmpPath := fmt.Sprintf("%s.tmp-%d", path, store.idCounter.Add(1))
+	tmpFile, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			os.Remove(tmpPath)
+		}
+	}()
+	var indexBuf bytes.Buffer
+	var offset int64
+	for _, ev := range kept {
+		data, err := json.Marshal(ev)
+		if err != nil {
+			return fmt.Errorf("marshal event: %w", err)
+		}
+		line := append(data, '\n')
+		fmt.Fprintf(&indexBuf, "%d %d\n", ev.Sequence, offset)
+		offset += int64(len(line))
+		if _, err := tmpFile.Write(line); err != nil {
+			return fmt.Errorf("write event: %w", err)
+		}
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("sync temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+	removeTmp = false
+	if err := writeFileSync(store.eventsIndexPath(sessionID), indexBuf.Bytes(), 0o600); err != nil {
+		return fmt.Errorf("write index: %w", err)
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync dir: %w", err)
+	}
+	session, err := store.readMetadata(sessionID)
+	if err != nil {
+		return err
+	}
+	session.EventCount = len(kept)
+	session.UpdatedAt = store.timestamp()
+	return store.writeMetadata(session)
+}
+
 func (store *Store) timestamp() string {
 	return store.now().UTC().Format(time.RFC3339)
 }
@@ -771,6 +991,10 @@ func (store *Store) metadataPath(sessionID string) string {
 
 func (store *Store) eventsPath(sessionID string) string {
 	return filepath.Join(store.sessionPath(sessionID), EventsFile)
+}
+
+func (store *Store) eventsIndexPath(sessionID string) string {
+	return filepath.Join(store.sessionPath(sessionID), EventsIndexFile)
 }
 
 func (store *Store) readMetadata(sessionID string) (Metadata, error) {

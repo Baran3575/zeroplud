@@ -216,6 +216,9 @@ func (store *Store) truncateEventsLocked(sessionID string, keepThroughSequence i
 	if len(kept) > 0 {
 		encoded = append(bytes.Join(kept, []byte{'\n'}), '\n')
 	}
+	if err := store.closeSessionWriters(sessionID); err != nil {
+		return fmt.Errorf("close writers: %w", err)
+	}
 	path := store.eventsPath(sessionID)
 	if err := store.writeFileAtomicSync(path, encoded, 0o600); err != nil {
 		return fmt.Errorf("write truncated events: %w", err)

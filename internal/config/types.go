@@ -41,6 +41,7 @@ type ProviderProfile struct {
 	Model           string            `json:"model,omitempty"`
 	ParseThinkTags  *bool             `json:"parseThinkTags,omitempty"`
 	Description     string            `json:"description,omitempty"`
+	RateLimits      *ModelRateLimits   `json:"rateLimits,omitempty"`
 }
 
 func HasProviderProfile(profile ProviderProfile) bool {
@@ -58,7 +59,8 @@ func HasProviderProfile(profile ProviderProfile) bool {
 		profile.CustomHeaders != nil ||
 		strings.TrimSpace(profile.Model) != "" ||
 		profile.ParseThinkTags != nil ||
-		strings.TrimSpace(profile.Description) != ""
+		strings.TrimSpace(profile.Description) != "" ||
+		profile.RateLimits != nil
 }
 
 type SandboxConfig struct {
@@ -95,6 +97,12 @@ type ToolsConfig struct {
 	deferThresholdSet bool
 }
 
+type ModelRateLimits struct {
+	RPM     int     `json:"rpm,omitempty"`
+	TPM     int     `json:"tpm,omitempty"`
+	MaxCost float64 `json:"max_cost,omitempty"`
+}
+
 type PreferencesConfig struct {
 	FavoriteModels []string `json:"favoriteModels,omitempty"`
 	// Theme is the persisted TUI palette preference — "auto" or a registered theme
@@ -105,6 +113,10 @@ type PreferencesConfig struct {
 	// the user turned post-turn recaps off. A *bool is its own tri-state, so no
 	// custom unmarshal is needed (unlike ToolsConfig.DeferThreshold's int).
 	Recaps *bool `json:"recaps,omitempty"`
+	// EnableRateLimiting turns on per-model rate limiting and cost budgets for
+	// this session. When enabled, the agent checks rate limits before each
+	// provider call and tracks costs against the configured max_cost budget.
+	EnableRateLimiting bool `json:"enableRateLimiting,omitempty"`
 }
 
 // RecapsEnabled reports whether post-turn recaps are on. Unset defaults to ON.
@@ -511,6 +523,7 @@ func (profile *ProviderProfile) UnmarshalJSON(data []byte) error {
 		ParseThinkTags       *bool             `json:"parseThinkTags"`
 		ParseThinkTagsSnake  *bool             `json:"parse_think_tags"`
 		Description          string            `json:"description"`
+		RateLimits           *ModelRateLimits   `json:"rateLimits"`
 	}
 
 	var raw rawProfile
@@ -534,6 +547,7 @@ func (profile *ProviderProfile) UnmarshalJSON(data []byte) error {
 	profile.Model = strings.TrimSpace(firstNonEmpty(raw.Model, raw.ModelID))
 	profile.ParseThinkTags = firstNonNilBool(raw.ParseThinkTags, raw.ParseThinkTagsSnake)
 	profile.Description = strings.TrimSpace(raw.Description)
+	profile.RateLimits = raw.RateLimits
 	return nil
 }
 

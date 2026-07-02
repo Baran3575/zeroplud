@@ -281,6 +281,14 @@ type Options struct {
 	// false leaves the loop byte-identical, so the interactive TUI is unaffected.
 	RequireCompletionSignal bool
 
+	// RateLimiter, when set, is checked before each StreamCompletion call. If a
+	// rate limit is exceeded the loop may wait or return an error. nil disables
+	// rate limiting.
+	RateLimiter *RateLimiter
+	// CostTracker, when set, records token usage and checks the per-session cost
+	// budget after each turn. nil disables cost tracking.
+	CostTracker *CostTracker
+
 	runPermissions *permissionRunState
 }
 

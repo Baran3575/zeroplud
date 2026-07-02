@@ -127,6 +127,17 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 	options.runPermissions = runPermissions
 	defer runPermissions.cleanup()
 
+	// Wrap OnUsage to also update the cost tracker when one is configured.
+	if options.CostTracker != nil {
+		originalOnUsage := options.OnUsage
+		options.OnUsage = func(usage zeroruntime.Usage) {
+			options.CostTracker.AddUsage(usage)
+			if originalOnUsage != nil {
+				originalOnUsage(usage)
+			}
+		}
+	}
+
 	messages := zeroruntime.SeedMessagesWithImages(buildSystemPrompt(options), prompt, options.Images)
 
 	guards := newGuardState()
@@ -171,6 +182,13 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 			options.OnContext(MeasureContext(messages, request.Tools, options.ContextWindow))
 		}
 
+		// Rate-limit gate: wait for token and request capacity before issuing
+		// the provider call. When the limiter is nil this is a no-op.
+		if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(request)); err != nil {
+			result.Messages = copyMessages(messages)
+			return result, err
+		}
+
 		// A transient upstream disconnect on the initial connect is retried with
 		// backoff (before any content is forwarded, so no OnText is duplicated);
 		// a context-limit / image-rejection / cancellation is NOT retried here —
@@ -184,6 +202,10 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 			// REACTIVE compaction: a context-limit failure on the call itself
 			// can be recovered by compacting once and retrying the same turn.
 			if compacted, retried, retryErr := compactor.recover(ctx, provider, messages, request.Tools, err.Error()); retried {
+				if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(request)); err != nil {
+					result.Messages = copyMessages(messages)
+					return result, err
+				}
 				messages = compacted
 				if retryErr != nil {
 					result.Messages = copyMessages(messages)
@@ -259,6 +281,9 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 					Tools:           exposed,
 					ReasoningEffort: options.ReasoningEffort,
 				}
+				if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(retryRequest)); err != nil {
+					return collected, err
+				}
 				retryStream, retryStreamErr := streamWithReconnect(ctx, provider, retryRequest, reconnectNoticeFor(options))
 				if retryStreamErr != nil {
 					return collected, retryStreamErr
@@ -317,6 +342,10 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 				Tools:           exposed,
 				ReasoningEffort: options.ReasoningEffort,
 			}
+			if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(retryRequest)); err != nil {
+				result.Messages = copyMessages(messages)
+				return result, err
+			}
 			retryStream, retryErr := streamWithReconnect(ctx, provider, retryRequest, reconnectNoticeFor(options))
 			if retryErr != nil {
 				result.Messages = copyMessages(messages)
@@ -337,6 +366,21 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 			if collected.Error != "" {
 				result.Messages = copyMessages(messages)
 				return result, errors.New(collected.Error)
+			}
+		}
+
+		// Cost-budget check: if the tracker is configured and the session's total
+		// cost has reached the max_cost ceiling, pause and prompt the user before
+		// continuing (mirrors the permission prompt pattern).
+		if options.CostTracker != nil && options.CostTracker.BudgetExceeded() {
+			if options.OnText != nil {
+				options.OnText(fmt.Sprintf(
+					"\n[Cost budget reached: $%.4f / $%.4f. "+
+						"The session will continue but costs will accumulate. "+
+						"Use /reset-cost to clear the tracker or adjust provider rate limits.]\n",
+					options.CostTracker.TotalCost(),
+					options.CostTracker.MaxCost(),
+				))
 			}
 		}
 
@@ -655,13 +699,17 @@ func finalAnswerAfterMaxTurns(ctx context.Context, provider Provider, messages [
 		Role:    zeroruntime.MessageRoleUser,
 		Content: maxTurnsFinalAnswerPrompt,
 	})
+	finalRequest := zeroruntime.CompletionRequest{
+		Messages:        copyMessages(finalMessages),
+		ReasoningEffort: options.ReasoningEffort,
+	}
+	if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(finalRequest)); err != nil {
+		return "", messages, ""
+	}
 	// The max-turns final-answer call is a pre-content connect, often after a long
 	// autonomous/cron run — route it through the reconnect helper so a single
 	// transient hiccup doesn't drop the final summary (AUDIT-L1).
-	stream, err := streamWithReconnect(ctx, provider, zeroruntime.CompletionRequest{
-		Messages:        copyMessages(finalMessages),
-		ReasoningEffort: options.ReasoningEffort,
-	}, reconnectNoticeFor(options))
+	stream, err := streamWithReconnect(ctx, provider, finalRequest, reconnectNoticeFor(options))
 	if err != nil {
 		return "", messages, ""
 	}
@@ -2721,4 +2769,39 @@ func copyMessages(messages []Message) []Message {
 		copied[index].Images = zeroruntime.CloneImageBlocks(message.Images)
 	}
 	return copied
+}
+
+// waitForRateLimit checks the rate limiter before issuing a provider call.
+// If the limiter is nil this is a no-op. It blocks until capacity is available
+// or the context is cancelled.
+func waitForRateLimit(ctx context.Context, limiter *RateLimiter, modelID string, tokens int) error {
+	if limiter == nil {
+		return nil
+	}
+	for {
+		if limiter.Allow(modelID, tokens) {
+			return nil
+		}
+		wait := limiter.WaitTime(modelID, tokens)
+		if wait <= 0 {
+			return errors.New("rate limit exceeded")
+		}
+		if err := sleepWithContext(ctx, wait); err != nil {
+			return err
+		}
+	}
+}
+
+// countRequestTokens estimates the total input tokens in a request for rate
+// limiting purposes. When the estimate is zero the limiter still counts 1
+// token per RPM gate check, so the RPM bucket is always consumed.
+func countRequestTokens(request zeroruntime.CompletionRequest) int {
+	total := 0
+	for _, msg := range request.Messages {
+		if msg.Content != "" {
+			total += len(strings.Fields(msg.Content))
+		}
+		total += len(msg.ToolCalls) * 50
+	}
+	return total
 }

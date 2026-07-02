@@ -1750,6 +1750,26 @@ func TestModelPickerRowOmitsProviderTag(t *testing.T) {
 	}
 }
 
+func TestModelPickerRowShowsSlugInline(t *testing.T) {
+	// The model slug/id should appear inline in faint text next to the label
+	// so users can tell models apart even when display names are truncated.
+	item := pickerItem{Label: "Claude Sonnet 4.6", Value: "claude-sonnet-4-6", Provider: "anthropic", Remote: true}
+	got := plainRender(t, renderModelPickerRow(60, false, item))
+	if !strings.Contains(got, "claude-sonnet-4-6") {
+		t.Fatalf("row = %q, missing model slug inline", got)
+	}
+}
+
+func TestModelPickerRowOmitsSlugWhenValueEqualsLabel(t *testing.T) {
+	// When Value and Label are the same, no duplicate slug is shown.
+	item := pickerItem{Label: "auto", Value: "auto"}
+	got := plainRender(t, renderModelPickerRow(60, false, item))
+	count := strings.Count(got, "auto")
+	if count > 1 {
+		t.Fatalf("row = %q, expected label shown once, got %d occurrences", got, count)
+	}
+}
+
 func TestModelPickerItemsCarryProviderTag(t *testing.T) {
 	m := limeTestModel()
 	picker := m.newModelPicker()

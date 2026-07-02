@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -10,6 +11,8 @@ import (
 	"github.com/Gitlawb/zero/internal/sandbox"
 	"github.com/Gitlawb/zero/internal/tools"
 )
+
+var controlTokenPattern = regexp.MustCompile(`<\|[^|]+\|>`)
 
 type rowKind int
 
@@ -82,6 +85,15 @@ func initialTranscript() []transcriptRow {
 	}}
 }
 
+// detectLeakedControlTokens checks text for leaked model control tokens like
+// <|...|> and returns a non-empty warning string if found.
+func detectLeakedControlTokens(text string) string {
+	if controlTokenPattern.MatchString(text) {
+		return "Model output may contain leaked control tokens (<|...|>). This can indicate a weak or misconfigured model that is leaking its internal prompt structure."
+	}
+	return ""
+}
+
 func reduceTranscript(rows []transcriptRow, action transcriptAction) []transcriptRow {
 	switch action.kind {
 	case actionClear:
@@ -89,7 +101,11 @@ func reduceTranscript(rows []transcriptRow, action transcriptAction) []transcrip
 	case actionAppendUser:
 		return appendRow(rows, rowUser, action.text)
 	case actionAppendAssistant:
-		return appendRow(rows, rowAssistant, action.text)
+		rows = appendRow(rows, rowAssistant, action.text)
+		if warning := detectLeakedControlTokens(action.text); warning != "" {
+			rows = appendRow(rows, rowSystem, "[zero] quality warning: "+warning)
+		}
+		return rows
 	case actionAppendSystem:
 		return appendRow(rows, rowSystem, action.text)
 	case actionAppendError:

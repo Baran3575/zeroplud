@@ -1,6 +1,77 @@
 package tui
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+func TestDetectLeakedControlTokensDetectsControlToken(t *testing.T) {
+	warning := detectLeakedControlTokens("Hello <|im_start|> world")
+	if warning == "" {
+		t.Fatal("expected warning for leaked control token")
+	}
+	if !strings.Contains(warning, "control tokens") {
+		t.Fatalf("expected warning to mention control tokens, got %q", warning)
+	}
+}
+
+func TestDetectLeakedControlTokensDetectsAnyAngleBracketPattern(t *testing.T) {
+	cases := []string{
+		"<|im_start|>",
+		"<|endoftext|>",
+		"prefix <|something|> suffix",
+		"<|im_end|>",
+	}
+	for _, tc := range cases {
+		if warning := detectLeakedControlTokens(tc); warning == "" {
+			t.Fatalf("expected warning for %q", tc)
+		}
+	}
+}
+
+func TestDetectLeakedControlTokensPassesCleanText(t *testing.T) {
+	cases := []string{
+		"",
+		"Hello world",
+		"Normal text with <b>HTML tags</b>",
+		"Markdown with <angle brackets>",
+		"Pipes | in text",
+	}
+	for _, tc := range cases {
+		if warning := detectLeakedControlTokens(tc); warning != "" {
+			t.Fatalf("unexpected warning for %q: %q", tc, warning)
+		}
+	}
+}
+
+func TestReduceTranscriptAppendsControlTokenWarning(t *testing.T) {
+	rows := reduceTranscript([]transcriptRow{}, transcriptAction{
+		kind: actionAppendAssistant,
+		text: "Here is the answer <|im_end|>",
+	})
+	found := false
+	for _, row := range rows {
+		if row.kind == rowSystem && strings.Contains(row.text, "control tokens") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected a system warning row for control token leakage")
+	}
+}
+
+func TestReduceTranscriptSkipsWarningForCleanText(t *testing.T) {
+	rows := reduceTranscript([]transcriptRow{}, transcriptAction{
+		kind: actionAppendAssistant,
+		text: "Clean text without control tokens",
+	})
+	for _, row := range rows {
+		if row.kind == rowSystem && strings.Contains(row.text, "control tokens") {
+			t.Fatalf("unexpected control token warning for clean text")
+		}
+	}
+}
 
 // appendTranscriptRowsDedup must produce byte-identical output to repeated
 // appendTranscriptRow (the O(n²) form it replaces), including keyed-row dedup and

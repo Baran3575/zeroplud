@@ -104,6 +104,372 @@ const escalationFailedNoticePrefix = "Note: could not switch to the requested mo
 // The system prompt (core coding-craft instructions + workspace context + safety
 // confirmation policy) is assembled in system_prompt.go via buildSystemPrompt.
 
+// executeTurnResult carries the output of a single turn's stream/collect cycle.
+type executeTurnResult struct {
+	collected zeroruntime.CollectedStream
+	messages  []zeroruntime.Message
+	exposed   []zeroruntime.ToolDefinition
+	err       error
+}
+
+// processToolCallsResult carries the output of processing a turn's tool calls.
+type processToolCallsResult struct {
+	messages       []zeroruntime.Message
+	changedFiles   []string
+	turnReqModel   string
+	failureHint    string
+	err            error
+}
+
+// evaluateCompletionResult carries the decision from the no-tool-call branch.
+type evaluateCompletionResult struct {
+	result              *Result
+	messages            []zeroruntime.Message
+	continueNudges      int
+	acceptanceRequested bool
+}
+
+// executeTurn handles the streaming, stall retry, and compaction recovery
+// for a single turn. It is extracted from the main Run loop so the loop body
+// reads as a clean pipeline.
+func executeTurn(ctx context.Context, provider Provider, messages []zeroruntime.Message, opts Options, compactor *compactionState, loaded map[string]bool) executeTurnResult {
+	exposed, _ := partitionTools(opts.Registry, opts.PermissionMode, opts, loaded)
+
+	messages = compactor.maybeCompact(ctx, provider, messages, exposed)
+	request := zeroruntime.CompletionRequest{
+		Messages:        copyMessages(messages),
+		Tools:           exposed,
+		ReasoningEffort: opts.ReasoningEffort,
+	}
+
+	if opts.OnContext != nil {
+		opts.OnContext(MeasureContext(messages, request.Tools, opts.ContextWindow))
+	}
+
+	if err := waitForRateLimit(ctx, opts.RateLimiter, opts.Model, countRequestTokens(request)); err != nil {
+		return executeTurnResult{err: err}
+	}
+
+	stream, err := streamWithReconnect(ctx, provider, request, reconnectNoticeFor(opts))
+	if err != nil {
+		if isImageRejectionError(err) {
+			return executeTurnResult{err: fmt.Errorf("model %s rejected the image: %s. The model may not support image input — try switching to a vision-capable model (claude, gpt-4o, gemini)", opts.Model, err.Error())}
+		}
+		if compacted, retried, retryErr := compactor.recover(ctx, provider, messages, request.Tools, err.Error()); retried {
+			if err := waitForRateLimit(ctx, opts.RateLimiter, opts.Model, countRequestTokens(request)); err != nil {
+				return executeTurnResult{err: err}
+			}
+			messages = compacted
+			if retryErr != nil {
+				return executeTurnResult{messages: messages, err: retryErr}
+			}
+			request = zeroruntime.CompletionRequest{
+				Messages:        copyMessages(messages),
+				Tools:           exposed,
+				ReasoningEffort: opts.ReasoningEffort,
+			}
+			stream, err = streamWithReconnect(ctx, provider, request, reconnectNoticeFor(opts))
+		}
+		if err != nil {
+			return executeTurnResult{messages: messages, err: err}
+		}
+	}
+
+	forwardedVisibleText := false
+	forwardingOpts := zeroruntime.CollectOptions{OnUsage: opts.OnUsage}
+	if opts.OnText != nil {
+		forwardingOpts.OnText = func(s string) { forwardedVisibleText = true; opts.OnText(s) }
+	}
+	if opts.OnReasoning != nil {
+		forwardingOpts.OnReasoning = func(s string) { opts.OnReasoning(s) }
+	}
+	if opts.OnToolCallStart != nil {
+		forwardingOpts.OnToolCallStart = func(id, name string) { opts.OnToolCallStart(id, name) }
+	}
+	if opts.OnToolCallDelta != nil {
+		forwardingOpts.OnToolCallDelta = func(id, fragment string) { opts.OnToolCallDelta(id, fragment) }
+	}
+	recoverStreamError := func(collected zeroruntime.CollectedStream) (zeroruntime.CollectedStream, error) {
+		if isImageRejectionError(errors.New(collected.Error)) {
+			return collected, fmt.Errorf("model %s rejected the image: %s. The model may not support image input — try switching to a vision-capable model (claude, gpt-4o, gemini)", opts.Model, collected.Error)
+		}
+		if compacted, retried, retryErr := compactor.recover(ctx, provider, messages, request.Tools, collected.Error); retried {
+			messages = compacted
+			if retryErr != nil {
+				return collected, retryErr
+			}
+			retryRequest := zeroruntime.CompletionRequest{
+				Messages:        copyMessages(messages),
+				Tools:           exposed,
+				ReasoningEffort: opts.ReasoningEffort,
+			}
+			if err := waitForRateLimit(ctx, opts.RateLimiter, opts.Model, countRequestTokens(retryRequest)); err != nil {
+				return collected, err
+			}
+			retryStream, retryStreamErr := streamWithReconnect(ctx, provider, retryRequest, reconnectNoticeFor(opts))
+			if retryStreamErr != nil {
+				return collected, retryStreamErr
+			}
+			collected = zeroruntime.CollectStreamWithOptions(ctx, retryStream, zeroruntime.CollectOptions{
+				OnUsage: opts.OnUsage,
+			})
+		}
+		return collected, nil
+	}
+
+	collected := zeroruntime.CollectStreamWithOptions(ctx, stream, forwardingOpts)
+	if collected.Error != "" {
+		updated, stop := recoverStreamError(collected)
+		collected = updated
+		if stop != nil {
+			return executeTurnResult{messages: messages, exposed: exposed, collected: collected, err: stop}
+		}
+	}
+	if ctx.Err() != nil {
+		return executeTurnResult{messages: messages, exposed: exposed, collected: collected, err: ctx.Err()}
+	}
+	for attempt := 1; attempt <= maxStreamStallRetries &&
+		isStreamTimeoutError(collected.Error) && !forwardedVisibleText &&
+		collected.Text == ""; attempt++ {
+		if notify := stallRetryNoticeFor(opts); notify != nil {
+			notify(attempt, maxStreamStallRetries)
+		}
+		if err := sleepWithContext(ctx, backoffFor(attempt)); err != nil {
+			return executeTurnResult{messages: messages, exposed: exposed, collected: collected, err: err}
+		}
+		retryRequest := zeroruntime.CompletionRequest{
+			Messages:        copyMessages(messages),
+			Tools:           exposed,
+			ReasoningEffort: opts.ReasoningEffort,
+		}
+		if err := waitForRateLimit(ctx, opts.RateLimiter, opts.Model, countRequestTokens(retryRequest)); err != nil {
+			return executeTurnResult{messages: messages, exposed: exposed, collected: collected, err: err}
+		}
+		retryStream, retryErr := streamWithReconnect(ctx, provider, retryRequest, reconnectNoticeFor(opts))
+		if retryErr != nil {
+			return executeTurnResult{messages: messages, exposed: exposed, collected: collected, err: retryErr}
+		}
+		collected = zeroruntime.CollectStreamWithOptions(ctx, retryStream, forwardingOpts)
+	}
+	if collected.Error != "" {
+		updated, stop := recoverStreamError(collected)
+		collected = updated
+		if stop != nil {
+			return executeTurnResult{messages: messages, exposed: exposed, collected: collected, err: stop}
+		}
+		if collected.Error != "" {
+			return executeTurnResult{messages: messages, exposed: exposed, collected: collected, err: errors.New(collected.Error)}
+		}
+	}
+
+	return executeTurnResult{
+		collected: collected,
+		messages:  messages,
+		exposed:   exposed,
+	}
+}
+
+// evaluateCompletion checks whether a no-tool-call turn qualifies as a final
+// answer or needs to continue (completion gate, acceptance check, nudges).
+func evaluateCompletion(ctx context.Context, collected zeroruntime.CollectedStream, messages []zeroruntime.Message, opts Options, guards *guardState, continueNudges int, acceptanceRequested bool) evaluateCompletionResult {
+	if collected.DroppedToolCalls > 0 {
+		messages = append(messages, zeroruntime.Message{
+			Role:    zeroruntime.MessageRoleUser,
+			Content: droppedToolCallNotice,
+		})
+		return evaluateCompletionResult{messages: messages, continueNudges: continueNudges, acceptanceRequested: acceptanceRequested}
+	}
+	if guards.observeTurn(collected) {
+		return evaluateCompletionResult{
+			result:              &Result{FinalAnswer: noOutputStopAnswer(opts.MaxTurns), Messages: copyMessages(messages)},
+			messages:            messages,
+			continueNudges:      continueNudges,
+			acceptanceRequested: acceptanceRequested,
+		}
+	}
+	if strings.TrimSpace(collected.Text) == "" {
+		messages = append(messages, zeroruntime.Message{
+			Role: zeroruntime.MessageRoleUser,
+			Content: "Your previous response had no visible output and no tool calls. " +
+				"Continue the task by using a tool or reply with your final answer.",
+		})
+		return evaluateCompletionResult{messages: messages, continueNudges: continueNudges, acceptanceRequested: acceptanceRequested}
+	}
+	if opts.RequireCompletionSignal {
+		if reason := selfReportedIncompletion(collected.Text); reason != "" {
+			return evaluateCompletionResult{
+				result: &Result{
+					Incomplete:       true,
+					IncompleteReason: reason,
+					FinalAnswer:      collected.Text,
+					Messages:         copyMessages(messages),
+				},
+				messages:            messages,
+				continueNudges:      continueNudges,
+				acceptanceRequested: acceptanceRequested,
+			}
+		}
+
+		cue := endsWithContinuationCue(collected.Text)
+		planPending := guards.pendingPlanItems()
+		if cue || planPending {
+			if continueNudges < maxContinueNudges {
+				continueNudges++
+				reason := "your message ended mid-step"
+				if !cue {
+					reason = "pending plan items remain — finish them, or mark them complete with update_plan if you are done"
+				}
+				messages = append(messages, zeroruntime.Message{
+					Role:    zeroruntime.MessageRoleUser,
+					Content: continueNudge(reason),
+				})
+				return evaluateCompletionResult{messages: messages, continueNudges: continueNudges, acceptanceRequested: acceptanceRequested}
+			}
+			if cue {
+				return evaluateCompletionResult{
+					result: &Result{
+						Incomplete:       true,
+						IncompleteReason: "your message ended mid-step",
+						FinalAnswer:      collected.Text,
+						Messages:         copyMessages(messages),
+					},
+					messages:            messages,
+					continueNudges:      continueNudges,
+					acceptanceRequested: acceptanceRequested,
+				}
+			}
+		}
+
+		if opts.SelfCorrect != nil && !acceptanceRequested {
+			acceptanceRequested = true
+			messages = append(messages, zeroruntime.Message{
+				Role:    zeroruntime.MessageRoleUser,
+				Content: acceptanceVerificationNudge(),
+			})
+			return evaluateCompletionResult{messages: messages, continueNudges: continueNudges, acceptanceRequested: acceptanceRequested}
+		}
+	}
+	return evaluateCompletionResult{
+		result: &Result{
+			FinalAnswer: collected.Text,
+			Messages:    copyMessages(messages),
+		},
+		messages:            messages,
+		continueNudges:      continueNudges,
+		acceptanceRequested: acceptanceRequested,
+	}
+}
+
+// processToolCalls handles tool dispatch, permissions, hooks, and
+// self-correction for a turn that produced tool calls.
+func processToolCalls(ctx context.Context, collected zeroruntime.CollectedStream, messages []zeroruntime.Message, opts Options, registry *tools.Registry, permissionMode PermissionMode, guards *guardState, loaded map[string]bool, turn int) processToolCallsResult {
+	failureHint := ""
+	turnRequestedModel := ""
+	var changedFilesThisBatch []string
+	for index, call := range collected.ToolCalls {
+		if opts.OnToolCall != nil {
+			opts.OnToolCall(call)
+		}
+		toolResult, abortErr := executeToolCall(ctx, registry, call, permissionMode, opts)
+		if opts.OnToolResult != nil {
+			opts.OnToolResult(toolResult)
+		}
+		for _, name := range toolResult.LoadedTools {
+			loaded[name] = true
+		}
+		if turnRequestedModel == "" && toolResult.RequestedModel != "" {
+			turnRequestedModel = toolResult.RequestedModel
+		}
+		messages = append(messages, zeroruntime.Message{
+			Role:       zeroruntime.MessageRoleTool,
+			Content:    toolResult.Output,
+			ToolCallID: toolResult.ToolCallID,
+		})
+
+		if abortErr == nil && ctx.Err() != nil {
+			abortErr = ctx.Err()
+		}
+		if abortErr != nil {
+			messages = appendAbortedToolResults(messages, collected.ToolCalls[index+1:])
+			return processToolCallsResult{messages: messages, err: abortErr}
+		}
+		if stopReason := stopReasonFromToolResult(toolResult); stopReason != "" {
+			messages = appendAbortedToolResults(messages, collected.ToolCalls[index+1:])
+			return processToolCallsResult{
+				messages:     messages,
+				turnReqModel: turnRequestedModel,
+				err:          errStopReason{result: Result{StopReason: stopReason, FinalAnswer: toolResult.Output}},
+			}
+		}
+
+		retriableFailure := isRetriableToolError(toolResult)
+		outcome := guards.observeToolResult(call.Name, retriableFailure, toolResult.Output)
+		if outcome.Stop {
+			messages = appendAbortedToolResults(messages, collected.ToolCalls[index+1:])
+			return processToolCallsResult{
+				messages:     messages,
+				turnReqModel: turnRequestedModel,
+				err:          errStopReason{result: Result{FinalAnswer: toolFailureStopAnswer(call.Name, outcome.Count)}},
+			}
+		}
+		if outcome.InjectHint && failureHint == "" {
+			failureHint = toolFailureHint(call.Name, toolSchemaJSON(registry, call.Name), toolResult.Output)
+		}
+
+		if opts.SelfCorrect != nil && toolResult.Status == tools.StatusOK && len(toolResult.ChangedFiles) > 0 {
+			changedFilesThisBatch = append(changedFilesThisBatch, toolResult.ChangedFiles...)
+		}
+	}
+
+	if opts.SelfCorrect != nil && len(changedFilesThisBatch) > 0 {
+		if feedback, _ := opts.SelfCorrect.AfterEdit(ctx, dedupeStrings(changedFilesThisBatch)); feedback != "" {
+			messages = append(messages, zeroruntime.Message{
+				Role:    zeroruntime.MessageRoleUser,
+				Content: feedback,
+			})
+		}
+	}
+
+	if collected.DroppedToolCalls > 0 {
+		messages = append(messages, zeroruntime.Message{
+			Role:    zeroruntime.MessageRoleUser,
+			Content: droppedToolCallNotice,
+		})
+	}
+
+	if failureHint != "" {
+		messages = append(messages, zeroruntime.Message{
+			Role:    zeroruntime.MessageRoleUser,
+			Content: failureHint,
+		})
+	} else if reminder := guards.progressReminder(); reminder != "" {
+		messages = append(messages, zeroruntime.Message{
+			Role:    zeroruntime.MessageRoleUser,
+			Content: reminder,
+		})
+	} else if reminder := guards.planReminder(turn); reminder != "" {
+		messages = append(messages, zeroruntime.Message{
+			Role:    zeroruntime.MessageRoleUser,
+			Content: reminder,
+		})
+	}
+
+	return processToolCallsResult{
+		messages:       messages,
+		changedFiles:   changedFilesThisBatch,
+		turnReqModel:   turnRequestedModel,
+		failureHint:    failureHint,
+	}
+}
+
+// errStopReason wraps a fully-formed Result with a stop reason so
+// processToolCalls can signal a non-error terminal condition.
+type errStopReason struct {
+	result Result
+}
+
+func (e errStopReason) Error() string { return string(e.result.StopReason) }
+
 func Run(ctx context.Context, prompt string, provider Provider, options Options) (Result, error) {
 	if provider == nil {
 		return Result{}, errors.New("agent provider is required")
@@ -127,7 +493,6 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 	options.runPermissions = runPermissions
 	defer runPermissions.cleanup()
 
-	// Wrap OnUsage to also update the cost tracker when one is configured.
 	if options.CostTracker != nil {
 		originalOnUsage := options.OnUsage
 		options.OnUsage = func(usage zeroruntime.Usage) {
@@ -143,235 +508,28 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 	guards := newGuardState()
 	compactor := newCompactionState(options)
 
-	// loaded tracks deferred-eligible tools the model has pulled via tool_search
-	// during THIS run. It is consulted by partitionTools each turn to expose a
-	// loaded tool's full schema; it lives only for the run (v1 within-run scope).
 	loaded := map[string]bool{}
 
-	// continueNudges counts how many times the headless completion gate
-	// (Options.RequireCompletionSignal) has re-prompted a no-tool-call turn that
-	// stopped with work still unfinished. Bounded by maxContinueNudges.
 	continueNudges := 0
-	// acceptanceRequested records that the one-time task-grounded acceptance check
-	// has already been demanded this run, so it fires at most once.
 	acceptanceRequested := false
+
+	// Propagate initialized local values back to options so extracted
+	// helper methods (executeTurn, processToolCalls) use the correct
+	// values rather than the raw uninitialized Options fields.
+	options.PermissionMode = permissionMode
+	options.Registry = registry
 
 	result := Result{Messages: copyMessages(messages)}
 	for turn := 0; turn < maxTurns; turn++ {
 		result.Turns = turn + 1
 
-		// Build the per-turn tool list first so proactive compaction can include
-		// the tool-definition tokens (they ride on every request) in its estimate.
-		// partitionTools depends only on registry/permissions/options/loaded, not on
-		// the messages, so computing it before compaction is safe.
-		exposed, _ := partitionTools(registry, permissionMode, options, loaded)
+		turndata := executeTurn(ctx, provider, messages, options, compactor, loaded)
+		if turndata.err != nil {
+			result.Messages = copyMessages(turndata.messages)
+			return result, turndata.err
+		}
+		messages = turndata.messages
 
-		// PROACTIVE compaction: if the history is approaching the model's
-		// context window, summarize the oldest middle before building the
-		// request. A no-op when ContextWindow == 0 (compaction disabled).
-		messages = compactor.maybeCompact(ctx, provider, messages, exposed)
-		request := zeroruntime.CompletionRequest{
-			Messages:        copyMessages(messages),
-			Tools:           exposed,
-			ReasoningEffort: options.ReasoningEffort,
-		}
-
-		// Report the per-category context budget for this turn so a surface can
-		// show utilization. Opt-in: a no-op when OnContext is unset.
-		if options.OnContext != nil {
-			options.OnContext(MeasureContext(messages, request.Tools, options.ContextWindow))
-		}
-
-		// Rate-limit gate: wait for token and request capacity before issuing
-		// the provider call. When the limiter is nil this is a no-op.
-		if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(request)); err != nil {
-			result.Messages = copyMessages(messages)
-			return result, err
-		}
-
-		// A transient upstream disconnect on the initial connect is retried with
-		// backoff (before any content is forwarded, so no OnText is duplicated);
-		// a context-limit / image-rejection / cancellation is NOT retried here —
-		// those fall through to their own handlers below.
-		stream, err := streamWithReconnect(ctx, provider, request, reconnectNoticeFor(options))
-		if err != nil {
-			if isImageRejectionError(err) {
-				result.Messages = copyMessages(messages)
-				return result, fmt.Errorf("model %s rejected the image: %s. The model may not support image input — try switching to a vision-capable model (claude, gpt-4o, gemini)", options.Model, err.Error())
-			}
-			// REACTIVE compaction: a context-limit failure on the call itself
-			// can be recovered by compacting once and retrying the same turn.
-			if compacted, retried, retryErr := compactor.recover(ctx, provider, messages, request.Tools, err.Error()); retried {
-				if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(request)); err != nil {
-					result.Messages = copyMessages(messages)
-					return result, err
-				}
-				messages = compacted
-				if retryErr != nil {
-					result.Messages = copyMessages(messages)
-					return result, retryErr
-				}
-				// Rebuild from the compacted messages but reuse the SAME active-mode
-				// partition computed for this turn: it depends
-				// on registry+loaded, not on the messages, so they stay valid after
-				// compaction. Using the bare toolDefinitions here would route through an
-				// empty-loaded partition, re-hiding every already-loaded deferred tool.
-				request = zeroruntime.CompletionRequest{
-					Messages:        copyMessages(messages),
-					Tools:           exposed,
-					ReasoningEffort: options.ReasoningEffort,
-				}
-				// Pre-content connect after a context-limit compaction: route through the
-				// reconnect helper so a transient upstream hiccup here doesn't fail the
-				// whole run and re-burn every token (AUDIT-L1).
-				stream, err = streamWithReconnect(ctx, provider, request, reconnectNoticeFor(options))
-			}
-			if err != nil {
-				result.Messages = copyMessages(messages)
-				return result, err
-			}
-		}
-
-		// forwardedVisibleText flags forwarded final PROSE (OnText) specifically —
-		// the only output whose re-stream on a stall retry would visibly DUPLICATE
-		// answer text the user already read. Transient working indicators
-		// (reasoning previews, tool-call "writing…" previews) are deliberately NOT
-		// counted: a turn that streamed only those then stalled — the common
-		// gpt-5.x / ollama "froze mid-write_file" case — is safe to re-issue, since
-		// the TUI resets the tool-call preview on the next tool-call-start and a
-		// stalled turn is never appended to `messages` (it returns on the error
-		// before the append), so the retry re-sends clean context with no
-		// conversation-state duplication.
-		forwardedVisibleText := false
-		forwardingOpts := zeroruntime.CollectOptions{OnUsage: options.OnUsage}
-		if options.OnText != nil {
-			forwardingOpts.OnText = func(s string) { forwardedVisibleText = true; options.OnText(s) }
-		}
-		if options.OnReasoning != nil {
-			forwardingOpts.OnReasoning = func(s string) { options.OnReasoning(s) }
-		}
-		if options.OnToolCallStart != nil {
-			forwardingOpts.OnToolCallStart = func(id, name string) { options.OnToolCallStart(id, name) }
-		}
-		if options.OnToolCallDelta != nil {
-			forwardingOpts.OnToolCallDelta = func(id, fragment string) { options.OnToolCallDelta(id, fragment) }
-		}
-		// recoverStreamError applies the same non-stall recovery the initial stream
-		// gets to ANY collected error — including one from a reissued (stall-retry)
-		// stream: an image rejection gets the friendly wrapping, and a context limit
-		// gets one compaction + reactive reissue (omitting visible callbacks, since
-		// any pre-error output was already forwarded). It returns the possibly-updated
-		// collected and a non-nil stop error when the run must end now.
-		recoverStreamError := func(collected zeroruntime.CollectedStream) (zeroruntime.CollectedStream, error) {
-			if isImageRejectionError(errors.New(collected.Error)) {
-				return collected, fmt.Errorf("model %s rejected the image: %s. The model may not support image input — try switching to a vision-capable model (claude, gpt-4o, gemini)", options.Model, collected.Error)
-			}
-			// REACTIVE compaction: the streamed error may also be a context limit
-			// (some providers surface it mid-stream). Compact and retry once.
-			if compacted, retried, retryErr := compactor.recover(ctx, provider, messages, request.Tools, collected.Error); retried {
-				messages = compacted
-				if retryErr != nil {
-					return collected, retryErr
-				}
-				// Reuse the SAME active-mode partition (exposed) from this turn rather
-				// than the bare toolDefinitions: exposed depends on registry+loaded (not
-				// the messages), so it stays valid after compaction.
-				retryRequest := zeroruntime.CompletionRequest{
-					Messages:        copyMessages(messages),
-					Tools:           exposed,
-					ReasoningEffort: options.ReasoningEffort,
-				}
-				if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(retryRequest)); err != nil {
-					return collected, err
-				}
-				retryStream, retryStreamErr := streamWithReconnect(ctx, provider, retryRequest, reconnectNoticeFor(options))
-				if retryStreamErr != nil {
-					return collected, retryStreamErr
-				}
-				collected = zeroruntime.CollectStreamWithOptions(ctx, retryStream, zeroruntime.CollectOptions{
-					OnUsage: options.OnUsage,
-				})
-			}
-			return collected, nil
-		}
-
-		collected := zeroruntime.CollectStreamWithOptions(ctx, stream, forwardingOpts)
-		if collected.Error != "" {
-			updated, stop := recoverStreamError(collected)
-			collected = updated
-			if stop != nil {
-				result.Messages = copyMessages(messages)
-				return result, stop
-			}
-		}
-		// Check ctx first: on cancellation helpers.go sets collected.Error to
-		// ctx.Err().Error(), so returning errors.New(collected.Error) would lose
-		// the wrapped sentinel and break errors.Is(err, context.Canceled).
-		if ctx.Err() != nil {
-			result.Messages = copyMessages(messages)
-			return result, ctx.Err()
-		}
-		// A stream idle/stall timeout is safely re-issued when the turn committed NO
-		// answer text — no forwarded visible prose (forwardedVisibleText) and no
-		// collected final text (collected.Text). This covers two cases:
-		//   1. Nothing streamed at all before the connection died (the original
-		//      macOS stale-pooled-connection hang past the response-header timeout).
-		//   2. The model streamed transient reasoning and began a tool call (e.g. a
-		//      large write_file) then froze mid-arguments — the common gpt-5.x /
-		//      ollama heartbeat-pause stall. That partial tool call is NEVER executed
-		//      (a turn with collected.Error returns before dispatch below) and NEVER
-		//      appended to `messages`, so a retry re-issues clean context; the only
-		//      re-render is transient previews, not duplicated answer text. This is
-		//      why the gate no longer excludes collected.ToolCalls: an incomplete
-		//      tool call from a timed-out stream is discard-and-retry, not output.
-		// A turn that forwarded real prose is NOT retried (it would duplicate visible
-		// answer text) and falls through to the error return below. Capped +
-		// exponential backoff, with a user-visible notice per attempt.
-		for attempt := 1; attempt <= maxStreamStallRetries &&
-			isStreamTimeoutError(collected.Error) && !forwardedVisibleText &&
-			collected.Text == ""; attempt++ {
-			if notify := stallRetryNoticeFor(options); notify != nil {
-				notify(attempt, maxStreamStallRetries)
-			}
-			if err := sleepWithContext(ctx, backoffFor(attempt)); err != nil {
-				result.Messages = copyMessages(messages)
-				return result, err
-			}
-			retryRequest := zeroruntime.CompletionRequest{
-				Messages:        copyMessages(messages),
-				Tools:           exposed,
-				ReasoningEffort: options.ReasoningEffort,
-			}
-			if err := waitForRateLimit(ctx, options.RateLimiter, options.Model, countRequestTokens(retryRequest)); err != nil {
-				result.Messages = copyMessages(messages)
-				return result, err
-			}
-			retryStream, retryErr := streamWithReconnect(ctx, provider, retryRequest, reconnectNoticeFor(options))
-			if retryErr != nil {
-				result.Messages = copyMessages(messages)
-				return result, retryErr
-			}
-			collected = zeroruntime.CollectStreamWithOptions(ctx, retryStream, forwardingOpts)
-		}
-		if collected.Error != "" {
-			// Route a reissued stream's non-stall error through the SAME recovery as
-			// the initial stream (image-rejection wrapping / context-limit compaction)
-			// rather than returning it raw.
-			updated, stop := recoverStreamError(collected)
-			collected = updated
-			if stop != nil {
-				result.Messages = copyMessages(messages)
-				return result, stop
-			}
-			if collected.Error != "" {
-				result.Messages = copyMessages(messages)
-				return result, errors.New(collected.Error)
-			}
-		}
-
-		// Cost-budget check: if the tracker is configured and the session's total
-		// cost has reached the max_cost ceiling, pause and prompt the user before
-		// continuing (mirrors the permission prompt pattern).
 		if options.CostTracker != nil && options.CostTracker.BudgetExceeded() {
 			if options.OnText != nil {
 				options.OnText(fmt.Sprintf(
@@ -384,284 +542,57 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 			}
 		}
 
-		// Carry the turn's terminal stop reason so a final answer cut off at the
-		// output token cap (or by a content filter) is reported as truncated. A
-		// tool-call turn normalizes to "" and clears any prior reason.
-		result.FinishReason = collected.FinishReason
+		result.FinishReason = turndata.collected.FinishReason
 
 		messages = append(messages, zeroruntime.Message{
 			Role:      zeroruntime.MessageRoleAssistant,
-			Content:   collected.Text,
-			ToolCalls: historySafeToolCalls(collected.ToolCalls),
-			// Preserve thinking blocks so the next turn can replay them; providers
-			// that use extended thinking reject tool conversations that drop them.
-			Reasoning: collected.ReasoningBlocks,
+			Content:   turndata.collected.Text,
+			ToolCalls: historySafeToolCalls(turndata.collected.ToolCalls),
+			Reasoning: turndata.collected.ReasoningBlocks,
 		})
 
-		if len(collected.ToolCalls) == 0 {
-			// The model intended a tool call but it was malformed and dropped.
-			// Tell it to retry rather than silently treating text as the answer.
-			// This path is handled before the no-output guard so a dropped-call
-			// turn is never counted as a runaway empty turn.
-			if collected.DroppedToolCalls > 0 {
-				messages = append(messages, zeroruntime.Message{
-					Role:    zeroruntime.MessageRoleUser,
-					Content: droppedToolCallNotice,
-				})
-				continue
+		if len(turndata.collected.ToolCalls) == 0 {
+			ecd := evaluateCompletion(ctx, turndata.collected, messages, options, guards, continueNudges, acceptanceRequested)
+			messages = ecd.messages
+			continueNudges = ecd.continueNudges
+			acceptanceRequested = ecd.acceptanceRequested
+			if ecd.result != nil {
+				ecd.result.Turns = result.Turns
+				if result.FinishReason != "" {
+					ecd.result.FinishReason = result.FinishReason
+				}
+				return *ecd.result, nil
 			}
-			// No-output guard: a turn with visible text is a real final answer.
-			// A truly-empty turn (no text, no tool calls, no dropped calls) is
-			// counted toward the runaway cap so we stop before burning maxTurns.
-			if guards.observeTurn(collected) {
-				result.FinalAnswer = noOutputStopAnswer(result.Turns)
+			continue
+		}
+
+		guards.observeTurn(turndata.collected)
+
+		pcd := processToolCalls(ctx, turndata.collected, messages, options, registry, permissionMode, guards, loaded, result.Turns)
+		messages = pcd.messages
+		if pcd.err != nil {
+			var stop errStopReason
+			if errors.As(pcd.err, &stop) {
+				result.FinalAnswer = stop.result.FinalAnswer
+				result.StopReason = stop.result.StopReason
 				result.Messages = copyMessages(messages)
 				return result, nil
 			}
-			if strings.TrimSpace(collected.Text) == "" {
-				// Empty-but-under-cap turn: nudge the model to make progress
-				// rather than treating the empty response as a final answer.
-				messages = append(messages, zeroruntime.Message{
-					Role: zeroruntime.MessageRoleUser,
-					Content: "Your previous response had no visible output and no tool calls. " +
-						"Continue the task by using a tool or reply with your final answer.",
-				})
-				continue
-			}
-			// Completion gate (headless): a turn with text but no tool call is the
-			// model's final answer ONLY when the work is actually done. Default off
-			// (RequireCompletionSignal), so interactive runs stay byte-identical.
-			if options.RequireCompletionSignal {
-				// (1) Self-report downgrade (strongest, unambiguous): the model's own
-				// final message admits it guessed / could not meet the objective. Checked
-				// FIRST so an admitted-impossible task is downgraded immediately (no wasted
-				// continue-nudges) and reports the accurate reason.
-				if reason := selfReportedIncompletion(collected.Text); reason != "" {
-					result.Incomplete = true
-					result.IncompleteReason = reason
-					result.FinalAnswer = collected.Text
-					result.Messages = copyMessages(messages)
-					return result, nil
-				}
-
-				// (2) The model stopped without a tool call while work may be unfinished:
-				//   - a continuation cue ("…Let me check the config:") is an unambiguous
-				//     mid-step stop;
-				//   - pending update_plan items are a WEAK, ambiguous signal (the model may
-				//     have finished without re-marking the last step).
-				// Nudge to continue (bounded). After the budget: a persisted continuation
-				// cue finalizes INCOMPLETE; pending-plan WITHOUT a cue does NOT (that would
-				// false-fail a completed run with stale bookkeeping) — fall through to the
-				// acceptance check / success.
-				cue := endsWithContinuationCue(collected.Text)
-				planPending := guards.pendingPlanItems()
-				if cue || planPending {
-					if continueNudges < maxContinueNudges {
-						continueNudges++
-						reason := "your message ended mid-step"
-						if !cue {
-							reason = "pending plan items remain — finish them, or mark them complete with update_plan if you are done"
-						}
-						messages = append(messages, zeroruntime.Message{
-							Role:    zeroruntime.MessageRoleUser,
-							Content: continueNudge(reason),
-						})
-						continue
-					}
-					if cue {
-						result.Incomplete = true
-						result.IncompleteReason = "your message ended mid-step"
-						result.FinalAnswer = collected.Text
-						result.Messages = copyMessages(messages)
-						return result, nil
-					}
-					// pending-plan only, budget spent: trust the model's completion claim
-					// over stale plan bookkeeping; fall through.
-				}
-
-				// (3) Task-grounded acceptance: before accepting a "done" turn as success,
-				// require ONE acceptance check grounded in the task's stated criterion
-				// (only when self-correct is on). Rejects "well-formed == correct",
-				// "existing-tests-pass == objective met", and "result == baseline" false
-				// successes. Bounded to a single pass; a genuine post-check completion
-				// (no admission, no cue) then finalizes as success on the next turn.
-				if options.SelfCorrect != nil && !acceptanceRequested {
-					acceptanceRequested = true
-					messages = append(messages, zeroruntime.Message{
-						Role:    zeroruntime.MessageRoleUser,
-						Content: acceptanceVerificationNudge(),
-					})
-					continue
-				}
-			}
-			result.FinalAnswer = collected.Text
 			result.Messages = copyMessages(messages)
-			return result, nil
+			return result, pcd.err
 		}
 
-		// A turn with tool calls is progress: update guard counters before
-		// executing so the empty-turn counter resets and plan-tracking signals
-		// stay current.
-		guards.observeTurn(collected)
-
-		failureHint := ""
-		// turnRequestedModel records the FIRST mid-run escalation target requested
-		// during this turn's tool batch. The actual provider switch happens once,
-		// after the batch, so every tool_result is recorded first and at most one
-		// switch occurs per turn.
-		turnRequestedModel := ""
-		// changedFilesThisBatch aggregates every file the turn's mutating tools
-		// touched, so post-edit self-correction runs ONCE over the union after the
-		// batch — one AfterEdit call keeps the per-run attempt budget accurate and
-		// avoids verifying an intermediate edit a later call in the same turn already
-		// superseded. Its feedback is appended after the loop so every advertised
-		// tool call keeps its tool_result contiguous (a user message interleaved
-		// between tool_results breaks strict provider replay) — same after-batch
-		// rationale as turnRequestedModel above.
-		var changedFilesThisBatch []string
-		for index, call := range collected.ToolCalls {
-			if options.OnToolCall != nil {
-				options.OnToolCall(call)
-			}
-			toolResult, abortErr := executeToolCall(ctx, registry, call, permissionMode, options)
-			if options.OnToolResult != nil {
-				options.OnToolResult(toolResult)
-			}
-			// Union the deferred tools this result asked to load into the per-run
-			// set BEFORE any abort/stop/guard branch, so a load that coincides with
-			// a turn-ending result is still recorded for the next turn's partition.
-			for _, name := range toolResult.LoadedTools {
-				loaded[name] = true
-			}
-			if turnRequestedModel == "" && toolResult.RequestedModel != "" {
-				turnRequestedModel = toolResult.RequestedModel
-			}
-			messages = append(messages, zeroruntime.Message{
-				Role:       zeroruntime.MessageRoleTool,
-				Content:    toolResult.Output,
-				ToolCallID: toolResult.ToolCallID,
-			})
-
-			// A tool may demand the run ABORT — a canceled/timed-out ask_user prompt
-			// returns context.Canceled rather than fabricating a headless answer. Stop
-			// promptly with that error (or run-context cancellation), keeping messages
-			// valid by closing out the still-advertised calls first.
-			if abortErr == nil && ctx.Err() != nil {
-				abortErr = ctx.Err()
-			}
-			if abortErr != nil {
-				messages = appendAbortedToolResults(messages, collected.ToolCalls[index+1:])
-				result.Messages = copyMessages(messages)
-				return result, abortErr
-			}
-			if stopReason := stopReasonFromToolResult(toolResult); stopReason != "" {
-				messages = appendAbortedToolResults(messages, collected.ToolCalls[index+1:])
-				result.FinalAnswer = toolResult.Output
-				result.StopReason = stopReason
-				result.Messages = copyMessages(messages)
-				return result, nil
-			}
-
-			// Repeated-failure guard: if a tool keeps failing the same way, hint
-			// once (with its schema) then halt — so no model loops on a bad call.
-			// Only RETRIABLE failures (bad arguments / execution errors) drive it:
-			// policy refusals (disabled tool, permission denial, sandbox block)
-			// aren't fixed by reformatting the call, so a "match this schema" hint
-			// would misdirect the model toward JSON shape or blocked behavior.
-			retriableFailure := isRetriableToolError(toolResult)
-			outcome := guards.observeToolResult(call.Name, retriableFailure, toolResult.Output)
-			if outcome.Stop {
-				// The assistant message advertised EVERY collected tool call, but
-				// the guard halts mid-turn so the calls after this one never run.
-				// Append an aborted placeholder result for each remaining call so
-				// every tool_use has a matching tool_result and the recorded
-				// messages stay valid for a strict provider replay (Anthropic
-				// rejects a tool_use with no answering tool_result).
-				messages = appendAbortedToolResults(messages, collected.ToolCalls[index+1:])
-				result.FinalAnswer = toolFailureStopAnswer(call.Name, outcome.Count)
-				result.Messages = copyMessages(messages)
-				return result, nil
-			}
-			if outcome.InjectHint && failureHint == "" {
-				failureHint = toolFailureHint(call.Name, toolSchemaJSON(registry, call.Name), toolResult.Output)
-			}
-
-			// Post-edit self-correction: collect the files this successful mutating
-			// tool changed; verification runs once over the union after the batch.
-			// A read-only tool (no ChangedFiles) never contributes.
-			if options.SelfCorrect != nil && toolResult.Status == tools.StatusOK && len(toolResult.ChangedFiles) > 0 {
-				changedFilesThisBatch = append(changedFilesThisBatch, toolResult.ChangedFiles...)
-			}
-		}
-
-		// Run post-edit self-correction once over the union of files this turn
-		// changed, then append any feedback after every tool_result is recorded so
-		// the assistant's tool_results stay contiguous (a user message between
-		// tool_results breaks strict provider replay). nil SelfCorrect is a no-op.
-		if options.SelfCorrect != nil && len(changedFilesThisBatch) > 0 {
-			if feedback, _ := options.SelfCorrect.AfterEdit(ctx, dedupeStrings(changedFilesThisBatch)); feedback != "" {
-				messages = append(messages, zeroruntime.Message{
-					Role:    zeroruntime.MessageRoleUser,
-					Content: feedback,
-				})
-			}
-		}
-
-		// Mid-run model escalation: if a tool asked to switch models this turn and
-		// a switcher is wired, rebuild the provider on the new model for the rest
-		// of the run. At most one switch per turn (first request wins). A switcher
-		// error is NON-FATAL — record a brief note and continue on the current
-		// model. nil switcher ⇒ requests are ignored entirely (escalation off).
-		if turnRequestedModel != "" && options.ModelSwitcher != nil {
-			newProvider, switchErr := options.ModelSwitcher(ctx, turnRequestedModel)
+		if pcd.turnReqModel != "" && options.ModelSwitcher != nil {
+			newProvider, switchErr := options.ModelSwitcher(ctx, pcd.turnReqModel)
 			if switchErr != nil {
 				messages = append(messages, zeroruntime.Message{
 					Role:    zeroruntime.MessageRoleUser,
-					Content: escalationFailedNoticePrefix + " (" + turnRequestedModel + "): " + switchErr.Error() + ". Continuing on " + options.Model + ".",
+					Content: escalationFailedNoticePrefix + " (" + pcd.turnReqModel + "): " + switchErr.Error() + ". Continuing on " + options.Model + ".",
 				})
 			} else if newProvider != nil {
-				// Reassign the local provider so the next turn's StreamCompletion and
-				// compaction use it; update options.Model so subsequent RunOptions.Model,
-				// context-window sizing, and usage attribution follow the new model.
 				provider = newProvider
-				options.Model = turnRequestedModel
-				// KNOWN LIMITATION (deferred): the compactor's context-window budget
-				// is fixed at run start from options.ContextWindow and is NOT updated
-				// here, so a switch to a model with a different window keeps compacting
-				// against the original budget. Fixing it needs a ModelSwitcher contract
-				// change (return the new window) — out of scope for this change.
+				options.Model = pcd.turnReqModel
 			}
-		}
-
-		// A turn can mix valid tool calls with a dropped (nameless) one. The valid
-		// calls executed above; surface the dropped call too so it is never
-		// silently ignored just because the turn also did real work. This is
-		// independent of (and additive to) the failure-hint / plan-reminder nudges.
-		if collected.DroppedToolCalls > 0 {
-			messages = append(messages, zeroruntime.Message{
-				Role:    zeroruntime.MessageRoleUser,
-				Content: droppedToolCallNotice,
-			})
-		}
-
-		// A repeated-failure hint (schema + exact error) takes priority over the
-		// planning reminders — fixing the failing call matters more than plan
-		// hygiene. Both are light, one-shot, user-role nudges.
-		if failureHint != "" {
-			messages = append(messages, zeroruntime.Message{
-				Role:    zeroruntime.MessageRoleUser,
-				Content: failureHint,
-			})
-		} else if reminder := guards.progressReminder(); reminder != "" {
-			messages = append(messages, zeroruntime.Message{
-				Role:    zeroruntime.MessageRoleUser,
-				Content: reminder,
-			})
-		} else if reminder := guards.planReminder(result.Turns); reminder != "" {
-			messages = append(messages, zeroruntime.Message{
-				Role:    zeroruntime.MessageRoleUser,
-				Content: reminder,
-			})
 		}
 	}
 

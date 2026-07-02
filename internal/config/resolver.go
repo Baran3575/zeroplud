@@ -84,52 +84,58 @@ const MaxTurnsCeiling = 500
 const defaultDeferThreshold = 3
 
 func Resolve(options ResolveOptions) (ResolvedConfig, error) {
-	configCacheMu.Lock()
-	if cache := configCache; cache.resolved != nil && time.Since(cache.time) < 2*time.Second {
+	hasConfigFile := options.UserConfigPath != "" || options.ProjectConfigPath != ""
+
+	if hasConfigFile {
+		configCacheMu.Lock()
+		if cache := configCache; cache.resolved != nil && time.Since(cache.time) < 2*time.Second {
+			var latestModTime time.Time
+			for _, path := range []string{options.UserConfigPath, options.ProjectConfigPath} {
+				if path == "" {
+					continue
+				}
+				fi, err := os.Stat(path)
+				if err != nil {
+					latestModTime = time.Time{}
+					break
+				}
+				if fi.ModTime().After(latestModTime) {
+					latestModTime = fi.ModTime()
+				}
+			}
+			if latestModTime.Equal(cache.modTime) {
+				configCacheMu.Unlock()
+				if cache.err != nil {
+					return ResolvedConfig{}, cache.err
+				}
+				return *cache.resolved, nil
+			}
+		}
+		configCacheMu.Unlock()
+	}
+
+	resolved, err := resolveUncached(options)
+
+	if hasConfigFile {
+		configCacheMu.Lock()
 		var latestModTime time.Time
 		for _, path := range []string{options.UserConfigPath, options.ProjectConfigPath} {
 			if path == "" {
 				continue
 			}
-			fi, err := os.Stat(path)
-			if err != nil {
-				latestModTime = time.Time{}
-				break
-			}
-			if fi.ModTime().After(latestModTime) {
+			fi, statErr := os.Stat(path)
+			if statErr == nil && fi.ModTime().After(latestModTime) {
 				latestModTime = fi.ModTime()
 			}
 		}
-		if latestModTime.Equal(cache.modTime) {
-			configCacheMu.Unlock()
-			if cache.err != nil {
-				return ResolvedConfig{}, cache.err
-			}
-			return *cache.resolved, nil
+		configCache = cachedConfig{
+			resolved: &resolved,
+			err:      err,
+			modTime:  latestModTime,
+			time:     time.Now(),
 		}
+		configCacheMu.Unlock()
 	}
-	configCacheMu.Unlock()
-
-	resolved, err := resolveUncached(options)
-
-	configCacheMu.Lock()
-	var latestModTime time.Time
-	for _, path := range []string{options.UserConfigPath, options.ProjectConfigPath} {
-		if path == "" {
-			continue
-		}
-		fi, statErr := os.Stat(path)
-		if statErr == nil && fi.ModTime().After(latestModTime) {
-			latestModTime = fi.ModTime()
-		}
-	}
-	configCache = cachedConfig{
-		resolved: &resolved,
-		err:      err,
-		modTime:  latestModTime,
-		time:     time.Now(),
-	}
-	configCacheMu.Unlock()
 
 	return resolved, err
 }

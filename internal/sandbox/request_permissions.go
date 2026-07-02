@@ -260,6 +260,7 @@ func (engine *Engine) GrantRequestPermissions(profile RequestPermissionProfile, 
 		for i := len(cleanups) - 1; i >= 0; i-- {
 			cleanups[i]()
 		}
+		engine.InvalidateCache()
 	}
 	if engine.scope != nil && profile.FileSystem != nil {
 		for _, path := range profile.FileSystem.Read {

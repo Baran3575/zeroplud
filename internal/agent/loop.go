@@ -10,11 +10,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/Gitlawb/zero/internal/hooks"
+		"github.com/Gitlawb/zero/internal/hooks"
+	"github.com/Gitlawb/zero/internal/providers/providerio"
 	"github.com/Gitlawb/zero/internal/redaction"
 	"github.com/Gitlawb/zero/internal/sandbox"
 	"github.com/Gitlawb/zero/internal/streamjson"
 	"github.com/Gitlawb/zero/internal/tools"
+	"github.com/Gitlawb/zero/internal/tui"
 	"github.com/Gitlawb/zero/internal/zeroruntime"
 )
 
@@ -550,6 +552,17 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 			ToolCalls: historySafeToolCalls(turndata.collected.ToolCalls),
 			Reasoning: turndata.collected.ReasoningBlocks,
 		})
+
+		if token := tui.DetectControlTokenLeakage(turndata.collected.Text); token != "" {
+			warning := "[zero] quality warning: Control token leaked: " + token + ". This can indicate a weak or misconfigured model that is leaking its internal prompt structure."
+			if options.OnText != nil {
+				options.OnText("\n" + warning + "\n")
+			}
+			messages = append(messages, zeroruntime.Message{
+				Role:    zeroruntime.MessageRoleUser,
+				Content: warning,
+			})
+		}
 
 		if len(turndata.collected.ToolCalls) == 0 {
 			ecd := evaluateCompletion(ctx, turndata.collected, messages, options, guards, continueNudges, acceptanceRequested)

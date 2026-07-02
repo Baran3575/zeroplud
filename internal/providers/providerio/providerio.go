@@ -378,6 +378,23 @@ func ScanSSEDataWithContext(
 	}
 }
 
+// ReadSSEStream reads all SSE events from a reader until EOF.
+func ReadSSEStream(r io.Reader) ([]SSEEvent, error) {
+	dec := NewSSEDecoder(r)
+	var events []SSEEvent
+	for {
+		event, err := dec.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	return events, nil
+}
+
 // ClassifiedError normalizes provider HTTP/stream errors and redacts secrets.
 func ClassifiedError(statusCode int, message string, secrets ...string) string {
 	switch statusCode {
@@ -517,4 +534,27 @@ func PositiveOrDefault(value int, fallback int, label string) (int, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", label)
 	}
 	return value, nil
+}
+
+// detectControlTokenLeakage reports whether text contains leaked model-internal
+// control tokens. A true result means a weak or misconfigured model is leaking
+// its internal prompt structure into user-visible output.
+var controlTokenLeakagePatterns = []string{
+	"<|eom|>",
+	"<|im_end|>",
+	"<|endoftext|>",
+	"<\\s>",
+}
+
+func DetectControlTokenLeakage(text string) bool {
+	if text == "" {
+		return false
+	}
+	lower := strings.ToLower(text)
+	for _, token := range controlTokenLeakagePatterns {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
 }

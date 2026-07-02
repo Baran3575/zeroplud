@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Gitlawb/zero/internal/modelregistry"
 	"github.com/Gitlawb/zero/internal/notify"
@@ -40,6 +42,26 @@ func (e *setupFixableError) Error() string { return e.err.Error() }
 
 func (e *setupFixableError) Unwrap() []error { return []error{e.err, e.sentinel} }
 
+var (
+	configCache   cachedConfig
+	configCacheMu sync.Mutex
+)
+
+type cachedConfig struct {
+	resolved *ResolvedConfig
+	err      error
+	modTime  time.Time
+	time     time.Time
+}
+
+// InvalidateConfigCache clears the resolver cache so the next call to Resolve
+// re-reads and re-parses the config file(s) from disk.
+func InvalidateConfigCache() {
+	configCacheMu.Lock()
+	configCache = cachedConfig{}
+	configCacheMu.Unlock()
+}
+
 // defaultMaxTurns is the per-run tool-turn budget when none is configured. 30 was
 // too low for real multi-step agentic work (agents ran out mid-task before reaching
 // later steps); 50 matches the old "deep" preset. Raise per-session with /turns.
@@ -62,6 +84,57 @@ const MaxTurnsCeiling = 500
 const defaultDeferThreshold = 3
 
 func Resolve(options ResolveOptions) (ResolvedConfig, error) {
+	configCacheMu.Lock()
+	if cache := configCache; cache.resolved != nil && time.Since(cache.time) < 2*time.Second {
+		var latestModTime time.Time
+		for _, path := range []string{options.UserConfigPath, options.ProjectConfigPath} {
+			if path == "" {
+				continue
+			}
+			fi, err := os.Stat(path)
+			if err != nil {
+				latestModTime = time.Time{}
+				break
+			}
+			if fi.ModTime().After(latestModTime) {
+				latestModTime = fi.ModTime()
+			}
+		}
+		if latestModTime.Equal(cache.modTime) {
+			configCacheMu.Unlock()
+			if cache.err != nil {
+				return ResolvedConfig{}, cache.err
+			}
+			return *cache.resolved, nil
+		}
+	}
+	configCacheMu.Unlock()
+
+	resolved, err := resolveUncached(options)
+
+	configCacheMu.Lock()
+	var latestModTime time.Time
+	for _, path := range []string{options.UserConfigPath, options.ProjectConfigPath} {
+		if path == "" {
+			continue
+		}
+		fi, statErr := os.Stat(path)
+		if statErr == nil && fi.ModTime().After(latestModTime) {
+			latestModTime = fi.ModTime()
+		}
+	}
+	configCache = cachedConfig{
+		resolved: &resolved,
+		err:      err,
+		modTime:  latestModTime,
+		time:     time.Now(),
+	}
+	configCacheMu.Unlock()
+
+	return resolved, err
+}
+
+func resolveUncached(options ResolveOptions) (ResolvedConfig, error) {
 	cfg := FileConfig{
 		MaxTurns: defaultMaxTurns,
 	}

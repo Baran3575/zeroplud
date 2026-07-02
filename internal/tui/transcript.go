@@ -12,8 +12,6 @@ import (
 	"github.com/Gitlawb/zero/internal/tools"
 )
 
-var controlTokenPattern = regexp.MustCompile(`<\|[^|]+\|>`)
-
 type rowKind int
 
 const (
@@ -85,11 +83,11 @@ func initialTranscript() []transcriptRow {
 	}}
 }
 
-// detectLeakedControlTokens checks text for leaked model control tokens like
-// <|...|> and returns a non-empty warning string if found.
+// detectLeakedControlTokens checks text for leaked model control tokens and
+// returns a non-empty warning string if found.
 func detectLeakedControlTokens(text string) string {
-	if controlTokenPattern.MatchString(text) {
-		return "Model output may contain leaked control tokens (<|...|>). This can indicate a weak or misconfigured model that is leaking its internal prompt structure."
+	if tok := DetectControlTokenLeakage(text); tok != "" {
+		return "⚠ Control token leaked: " + tok
 	}
 	return ""
 }

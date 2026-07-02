@@ -667,6 +667,8 @@ func renderSystemNote(text string, width int) string {
 	marker, style := zeroTheme.faint.Render("·"), zeroTheme.muted
 	if isCancellationNotice(trimmed) {
 		marker, style = zeroTheme.amber.Render("⊘"), zeroTheme.amber
+	} else if isControlTokenWarning(trimmed) {
+		marker, style = zeroTheme.amber.Render("⚠"), zeroTheme.amber
 	}
 	srcLines := strings.Split(trimmed, "\n")
 	out := make([]string, 0, len(srcLines))
@@ -685,6 +687,12 @@ func renderSystemNote(text string, width int) string {
 func isCancellationNotice(text string) bool {
 	t := strings.ToLower(strings.TrimSpace(text))
 	return !strings.Contains(t, "\n") && strings.HasPrefix(t, "run cancelled")
+}
+
+// isControlTokenWarning reports whether a system notice is a control token
+// leakage warning, so it renders in amber with a warning marker.
+func isControlTokenWarning(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "⚠ Control token leaked:")
 }
 
 func renderCommandCardRow(text string, width int) string {

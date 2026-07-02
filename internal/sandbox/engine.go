@@ -3,8 +3,10 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -14,6 +16,11 @@ type EngineOptions struct {
 	Store         *GrantStore
 	Backend       Backend
 	Scope         *Scope
+}
+
+type cachedDecision struct {
+	decision  Decision
+	expiresAt time.Time
 }
 
 type Engine struct {
@@ -26,6 +33,9 @@ type Engine struct {
 	sessionProfiles *permissionProfileGrantSet
 	turnProfiles    *permissionProfileGrantSet
 	commandPrefixes *commandPrefixGrantSet
+	decisionCache   map[string]cachedDecision
+	cacheMu         sync.Mutex
+	cacheTTL        time.Duration
 }
 
 func NewEngine(options EngineOptions) *Engine {
@@ -58,6 +68,8 @@ func NewEngine(options EngineOptions) *Engine {
 		sessionProfiles: newPermissionProfileGrantSet(),
 		turnProfiles:    newPermissionProfileGrantSet(),
 		commandPrefixes: newCommandPrefixGrantSet(),
+		decisionCache:   make(map[string]cachedDecision),
+		cacheTTL:        5 * time.Second,
 	}
 }
 
@@ -285,6 +297,56 @@ func (engine *Engine) Evaluate(ctx context.Context, request Request) Decision {
 	if engine == nil {
 		return Decision{Action: ActionAllow, Risk: Classify(request), Reason: "sandbox disabled"}
 	}
+	if d, ok := engine.checkCache(request); ok {
+		return d
+	}
+	d := engine.evaluateUncached(ctx, request)
+	if d.Action != ActionDeny {
+		engine.storeInCache(request, d)
+	}
+	return d
+}
+
+func (engine *Engine) cacheKey(request Request) string {
+	return fmt.Sprintf("%s|%v|%s|%s|%v|%s|%s",
+		request.ToolName,
+		fmt.Sprintf("%v", request.Args),
+		request.SideEffect,
+		request.Permission,
+		request.PermissionGranted,
+		request.PermissionMode,
+		request.WorkspaceRoot,
+	)
+}
+
+func (engine *Engine) checkCache(request Request) (Decision, bool) {
+	engine.cacheMu.Lock()
+	defer engine.cacheMu.Unlock()
+	cd, ok := engine.decisionCache[engine.cacheKey(request)]
+	if !ok || time.Now().After(cd.expiresAt) {
+		return Decision{}, false
+	}
+	return cd.decision, true
+}
+
+func (engine *Engine) storeInCache(request Request, d Decision) {
+	engine.cacheMu.Lock()
+	defer engine.cacheMu.Unlock()
+	engine.decisionCache[engine.cacheKey(request)] = cachedDecision{
+		decision:  d,
+		expiresAt: time.Now().Add(engine.cacheTTL),
+	}
+}
+
+// InvalidateCache clears the decision cache. Call this when grants change so
+// the next Evaluate call recomputes its decision instead of returning a stale one.
+func (engine *Engine) InvalidateCache() {
+	engine.cacheMu.Lock()
+	defer engine.cacheMu.Unlock()
+	engine.decisionCache = make(map[string]cachedDecision)
+}
+
+func (engine *Engine) evaluateUncached(ctx context.Context, request Request) Decision {
 	policy := engine.effectivePolicy(engine.policy)
 	if policy.Mode == "" {
 		policy = DefaultPolicy()
@@ -423,7 +485,11 @@ func (engine *Engine) Grant(input GrantInput) (Grant, error) {
 	if err != nil {
 		return Grant{}, err
 	}
-	return engine.store.Grant(input)
+	grant, err := engine.store.Grant(input)
+	if err == nil {
+		engine.InvalidateCache()
+	}
+	return grant, err
 }
 
 func (engine *Engine) GrantForSession(input GrantInput) (Grant, error) {
@@ -434,13 +500,14 @@ func (engine *Engine) GrantForSession(input GrantInput) (Grant, error) {
 	if err != nil {
 		return Grant{}, err
 	}
-	grant, err := createGrant(input, time.Now)
+	grantResult, err := createGrant(input, time.Now)
 	if err != nil {
 		return Grant{}, err
 	}
-	grant.Session = true
-	engine.sessionGrants.add(grant)
-	return grant, nil
+	grantResult.Session = true
+	engine.sessionGrants.add(grantResult)
+	engine.InvalidateCache()
+	return grantResult, nil
 }
 
 func (engine *Engine) normalizeGrantInput(input GrantInput) (GrantInput, error) {

@@ -768,11 +768,11 @@ func (m model) handleProviderWizardKey(msg tea.KeyMsg) (model, tea.Cmd) {
 		m.providerWizard.move(1)
 	case keyIs(msg, tea.KeyLeft):
 		m.providerWizard.retreat()
-	case keyIs(msg, tea.KeyRight):
-		if m.providerWizard.canAdvanceWithRight() {
-			return m.advanceProviderWizard()
-		}
-	case keyIs(msg, tea.KeyEnter):
+		case keyIs(msg, tea.KeyRight):
+			if m.providerWizard.canAdvanceWithRight() && m.providerWizard.step != providerWizardStepModel {
+				return m.advanceProviderWizard()
+			}
+		case keyIs(msg, tea.KeyEnter):
 		if m.providerWizard.step == providerWizardStepDone {
 			return m.applyProviderWizard()
 		}
@@ -1571,6 +1571,9 @@ func (wizard *providerWizardState) renderSelectableModel(width int, index int, m
 		marker = surface(zeroTheme.accent).Render("❯ ")
 	}
 	left := marker + surface(zeroTheme.ink).Render(model.displayLabel())
+	if slug := strings.TrimSpace(model.ID); slug != "" && slug != model.displayLabel() {
+		left += surface(zeroTheme.faintest).Render(" " + slug)
+	}
 	return fitStyledLine(left, width)
 }
 

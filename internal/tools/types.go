@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/Gitlawb/zero/internal/sandbox"
+	"github.com/Gitlawb/zero/internal/streamjson"
 )
 
 type SideEffect string
@@ -104,6 +105,35 @@ type Result struct {
 	ChangedFiles []string
 	// Display carries a short, structured summary for the TUI / stream.
 	Display Display
+}
+
+// ToolOptions is a value object that carries per-invocation context into a tool
+// BEFORE Run is called, eliminating the need for optional interfaces that type-
+// switch on the tool. Tools that implement ConfigurableTool receive their options
+// through Configure; tools that don't fall back to the existing optional interfaces
+// (optionsAwareTool, sandboxAwareTool) for backward compatibility.
+type ToolOptions struct {
+	PermissionGranted bool
+	PermissionMode    string
+	Autonomy          string
+	Sandbox           *sandbox.Engine
+	ToolCallID        string
+	SessionID         string
+	Model             string
+	ReasoningEffort   string
+	Depth             int
+	Cwd               string
+	FileTracker       *FileTracker
+	EnabledTools      []string
+	DisabledTools     []string
+	Progress          func(streamjson.Event)
+}
+
+// ConfigurableTool is an optional interface a Tool can implement to receive
+// ToolOptions before Run is called. This is the preferred mechanism over the
+// older optionsAwareTool / sandboxAwareTool pattern.
+type ConfigurableTool interface {
+	Configure(ctx context.Context, opts ToolOptions)
 }
 
 // Display carries a short, structured summary of a tool result for the TUI/stream.

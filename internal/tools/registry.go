@@ -174,6 +174,30 @@ func (registry *Registry) RunWithOptions(ctx context.Context, name string, args 
 		return res
 	}
 
+	if configurable, ok := tool.(ConfigurableTool); ok {
+		configurable.Configure(ctx, ToolOptions{
+			PermissionGranted: options.PermissionGranted,
+			PermissionMode:    options.PermissionMode,
+			Autonomy:          options.Autonomy,
+			Sandbox:           options.Sandbox,
+			ToolCallID:        options.ToolCallID,
+			SessionID:         options.SessionID,
+			Model:             options.Model,
+			ReasoningEffort:   options.ReasoningEffort,
+			Depth:             options.Depth,
+			Cwd:               options.Cwd,
+			FileTracker:       options.FileTracker,
+			EnabledTools:      options.EnabledTools,
+			DisabledTools:     options.DisabledTools,
+			Progress:          options.Progress,
+		})
+		res := tool.Run(ctx, args)
+		if res.SandboxDecision == nil {
+			res.SandboxDecision = sandboxDecision
+		}
+		return res
+	}
+
 	if optioned, ok := tool.(optionsAwareTool); ok {
 		res := optioned.RunWithOptions(ctx, args, options)
 		if res.SandboxDecision == nil {

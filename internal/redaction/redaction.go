@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -80,6 +81,14 @@ var textSecretPatterns = []*regexp.Regexp{
 }
 
 var (
+	combinedTextSecretPattern = sync.OnceValue(func() *regexp.Regexp {
+		parts := make([]string, len(textSecretPatterns))
+		for i, p := range textSecretPatterns {
+			parts[i] = p.String()
+		}
+		return regexp.MustCompile(`(?i)(?:` + strings.Join(parts, "|") + `)`)
+	})
+
 	privateKeyPattern = regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`)
 	jsonStringPattern = regexp.MustCompile(`("([^"\\]*(?:\\.[^"\\]*)*)"\s*:\s*)"([^"\\]*(?:\\.[^"\\]*)*)"`)
 	assignPattern     = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_.-]*)(\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s&]+))`)
@@ -185,8 +194,6 @@ func RedactString(value string, options Options) string {
 	})
 	redacted = headerPattern.ReplaceAllStringFunc(redacted, func(match string) string {
 		groups := headerPattern.FindStringSubmatch(match)
-		// groups[2] is the known scheme (kept for readability) or "" for an opaque /
-		// custom-scheme credential — in which case the whole value is redacted (M12).
 		if groups[2] != "" {
 			return groups[1] + ": " + groups[2] + " " + replacement
 		}
@@ -201,8 +208,10 @@ func RedactString(value string, options Options) string {
 		}
 		return parts[1] + parts[2] + "=" + replacement
 	})
-	for _, pattern := range textSecretPatterns {
-		redacted = pattern.ReplaceAllString(redacted, replacement)
+	// Skip the combined text-secret pattern pass for tiny outputs (just a few
+	// characters) that cannot contain a useful key.
+	if len(redacted) >= 32 {
+		redacted = combinedTextSecretPattern().ReplaceAllString(redacted, replacement)
 	}
 	return redacted
 }

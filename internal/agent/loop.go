@@ -11,7 +11,6 @@ import (
 	"sync"
 
 		"github.com/Gitlawb/zero/internal/hooks"
-	"github.com/Gitlawb/zero/internal/providers/providerio"
 	"github.com/Gitlawb/zero/internal/redaction"
 	"github.com/Gitlawb/zero/internal/sandbox"
 	"github.com/Gitlawb/zero/internal/streamjson"
@@ -577,7 +576,7 @@ func Run(ctx context.Context, prompt string, provider Provider, options Options)
 			Reasoning: turndata.collected.ReasoningBlocks,
 		})
 
-		if token := tui.DetectControlTokenLeakage(turndata.collected.Text); token != "" {
+		if token := detectControlTokenLeakage(turndata.collected.Text); token != "" {
 			warning := "[zero] quality warning: Control token leaked: " + token + ". This can indicate a weak or misconfigured model that is leaking its internal prompt structure."
 			if options.OnText != nil {
 				options.OnText("\n" + warning + "\n")
